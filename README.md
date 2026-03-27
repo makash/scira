@@ -6,6 +6,10 @@
 
 For the first cut, it bundles the `pypi-supply-chain-response` expertise from [agent-infra-security](https://github.com/makash/agent-infra-security) and ships with a built-in `litellm` incident flow.
 
+![SCIRA demo](assets/demo.gif)
+
+*A quick scan → explain flow for the bundled LiteLLM incident.*
+
 ## What it does
 
 - scans a target folder or broad host-visible paths
