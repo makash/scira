@@ -4,7 +4,7 @@
 
 `scira` is a single-binary host/folder incident-response agent for Python/PyPI supply chain incidents.
 
-For the first cut, it bundles the `pypi-supply-chain-response` expertise from `agent-infra-security` and ships with a built-in `litellm` incident flow.
+For the first cut, it bundles the `pypi-supply-chain-response` expertise from [agent-infra-security](https://github.com/makash/agent-infra-security) and ships with a built-in `litellm` incident flow.
 
 ## What it does
 
