@@ -1,8 +1,10 @@
 # scira
 
+**SCIRA** stands for **Supply Chain Incident Response Agent**.
+
 `scira` is a single-binary host/folder incident-response agent for Python/PyPI supply chain incidents.
 
-For the first cut, it bundles the `pypi-supply-chain-response` expertise from `agent-infra-security` and ships with a built-in `litellm` incident profile.
+For the first cut, it bundles the `pypi-supply-chain-response` expertise from `agent-infra-security` and ships with a built-in `litellm` incident flow.
 
 ## What it does
 
@@ -28,6 +30,34 @@ You can also explain a saved JSON report later:
 ```bash
 scira scan litellm --format json --output report.json
 scira explain report.json
+```
+
+## Install
+
+Download the right binary from the [GitHub Releases](../../releases) page, rename it to `scira`, and make it executable.
+
+### macOS (Apple Silicon)
+
+```bash
+curl -L -o scira https://github.com/makash/scira/releases/download/v0.1.0/scira-darwin-arm64
+chmod +x scira
+./scira scan litellm
+```
+
+### macOS (Intel)
+
+```bash
+curl -L -o scira https://github.com/makash/scira/releases/download/v0.1.0/scira-darwin-amd64
+chmod +x scira
+./scira scan litellm
+```
+
+### Linux (x86_64)
+
+```bash
+curl -L -o scira https://github.com/makash/scira/releases/download/v0.1.0/scira-linux-amd64
+chmod +x scira
+./scira scan litellm
 ```
 
 ## LLM setup
