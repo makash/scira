@@ -18,8 +18,10 @@ use walkdir::{DirEntry, WalkDir};
 
 const MAX_TEXT_FILE_BYTES: u64 = 5 * 1024 * 1024;
 const MAX_RECORDED_LIMITATION_ITEMS: usize = 100;
-const BUNDLED_SKILL_MD: &str = include_str!("../bundled/pypi-supply-chain-response/SKILL.md");
-const BUNDLED_IOC_PATTERNS_MD: &str = include_str!("../bundled/pypi-supply-chain-response/references/ioc-patterns.md");
+const BUNDLED_PYPI_SKILL_MD: &str = include_str!("../bundled/pypi-supply-chain-response/SKILL.md");
+const BUNDLED_PYPI_IOC_PATTERNS_MD: &str = include_str!("../bundled/pypi-supply-chain-response/references/ioc-patterns.md");
+const BUNDLED_NPM_SKILL_MD: &str = include_str!("../bundled/npm-supply-chain-response/SKILL.md");
+const BUNDLED_NPM_IOC_PATTERNS_MD: &str = include_str!("../bundled/npm-supply-chain-response/references/ioc-patterns.md");
 
 #[derive(Parser, Debug)]
 #[command(name = "scira")]
@@ -40,7 +42,7 @@ enum Commands {
 
 #[derive(Args, Debug)]
 struct ScanArgs {
-    /// Bundled incident identifier. First cut supports: litellm
+    /// Bundled incident identifier. Current built-ins: litellm, axios
     incident: String,
 
     /// Scan this target path. Defaults to the current directory.
@@ -107,6 +109,8 @@ struct IncidentProfile {
     package: &'static str,
     bad_versions: &'static [&'static str],
     safe_version: &'static str,
+    malicious_dependency: Option<&'static str>,
+    related_package_names: &'static [&'static str],
     ioc_domains: &'static [&'static str],
     ioc_files: &'static [&'static str],
     search_patterns: &'static [&'static str],
@@ -116,6 +120,8 @@ struct IncidentProfile {
     source_repo: &'static str,
     source_skill: &'static str,
     source_version: &'static str,
+    bundled_skill_md: &'static str,
+    bundled_ioc_patterns_md: &'static str,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -410,11 +416,11 @@ fn perform_scan(
     let candidate_files = collect_candidate_files(target, &matcher, &mut limitations)?;
     scan_candidate_files(profile, target, &candidate_files, &mut findings, &mut limitations)?;
 
-    let python_scan = scan_python_environment(profile, &mut limitations)?;
-    findings.environment_hits.extend(python_scan.findings);
-    findings.cache_hits.extend(python_scan.cache_hits);
-    findings.ioc_file_hits.extend(python_scan.ioc_file_hits);
-    findings.skipped_checks.extend(python_scan.skipped_checks);
+    let environment_scan = scan_environment(profile, target, &mut limitations)?;
+    findings.environment_hits.extend(environment_scan.findings);
+    findings.cache_hits.extend(environment_scan.cache_hits);
+    findings.ioc_file_hits.extend(environment_scan.ioc_file_hits);
+    findings.skipped_checks.extend(environment_scan.skipped_checks);
 
     let summary = build_summary(&findings, &limitations);
     let actions = build_actions(profile, &summary, &limitations);
@@ -468,7 +474,11 @@ fn scan_candidate_files(
     findings: &mut Findings,
     limitations: &mut Limitations,
 ) -> Result<()> {
-    let package_re = Regex::new(&format!(r"(?i)\b{}\b", regex::escape(profile.package)))?;
+    let package_res: Vec<Regex> = profile
+        .related_package_names
+        .iter()
+        .map(|name| Regex::new(&format!(r"(?i)\b{}\b", regex::escape(name))))
+        .collect::<Result<Vec<_>, _>>()?;
     let exact_pin_re = Regex::new(&format!(
         r"(?i)\b{}\b(?:\[[^\]]+\])?\s*==\s*([A-Za-z0-9._+-]+)",
         regex::escape(profile.package)
@@ -493,8 +503,15 @@ fn scan_candidate_files(
             }
         };
 
+        let file_name = file.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        match file_name {
+            "package.json" => parse_package_json(profile, file, &content, findings),
+            "package-lock.json" => parse_package_lock_json(profile, file, &content, findings),
+            _ => {}
+        }
+
         for (idx, line) in content.lines().enumerate() {
-            if package_re.is_match(line) {
+            if package_res.iter().any(|re| re.is_match(line)) {
                 let pinned_version = exact_pin_re
                     .captures(line)
                     .and_then(|caps| caps.get(1).map(|m| m.as_str().to_string()));
@@ -543,6 +560,127 @@ fn scan_candidate_files(
     )?);
 
     Ok(())
+}
+
+fn parse_package_json(profile: &IncidentProfile, file: &Path, content: &str, findings: &mut Findings) {
+    let Ok(json) = serde_json::from_str::<Value>(content) else {
+        return;
+    };
+
+    for section in ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"] {
+        if let Some(deps) = json.get(section).and_then(|v| v.as_object()) {
+            for name in profile.related_package_names {
+                if let Some(version) = deps.get(*name).and_then(|v| v.as_str()) {
+                    findings.manifest_hits.push(ManifestHit {
+                        path: file.display().to_string(),
+                        line_number: 0,
+                        line: format!("{section}.{name} = {version}"),
+                        pinned_version: if is_exact_npm_version(version) {
+                            Some(version.to_string())
+                        } else {
+                            None
+                        },
+                        match_kind: if is_exact_npm_version(version) {
+                            ManifestMatchKind::PinnedReference
+                        } else {
+                            ManifestMatchKind::LooseReference
+                        },
+                    });
+
+                    if is_exact_npm_version(version) {
+                        findings.version_hits.push(VersionHit {
+                            path: file.display().to_string(),
+                            line_number: 0,
+                            line: format!("{section}.{name} = {version}"),
+                            version: version.to_string(),
+                            status: classify_version(profile, version),
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn parse_package_lock_json(profile: &IncidentProfile, file: &Path, content: &str, findings: &mut Findings) {
+    let Ok(json) = serde_json::from_str::<Value>(content) else {
+        return;
+    };
+
+    if let Some(packages) = json.get("packages").and_then(|v| v.as_object()) {
+        for (package_path, package_meta) in packages {
+            for name in profile.related_package_names {
+                let node_module_suffix = format!("node_modules/{name}");
+                if package_path == &node_module_suffix || package_path.ends_with(&format!("/{node_module_suffix}")) {
+                    let version = package_meta
+                        .get("version")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    findings.manifest_hits.push(ManifestHit {
+                        path: file.display().to_string(),
+                        line_number: 0,
+                        line: format!("packages[{package_path}] version {version}"),
+                        pinned_version: Some(version.to_string()),
+                        match_kind: ManifestMatchKind::PinnedReference,
+                    });
+                    findings.version_hits.push(VersionHit {
+                        path: file.display().to_string(),
+                        line_number: 0,
+                        line: format!("packages[{package_path}] version {version}"),
+                        version: version.to_string(),
+                        status: classify_version(profile, version),
+                    });
+                }
+            }
+        }
+    }
+
+    if let Some(dependencies) = json.get("dependencies").and_then(|v| v.as_object()) {
+        collect_package_lock_dependencies(profile, file, dependencies, Vec::new(), findings);
+    }
+}
+
+fn collect_package_lock_dependencies(
+    profile: &IncidentProfile,
+    file: &Path,
+    dependencies: &serde_json::Map<String, Value>,
+    parent_chain: Vec<String>,
+    findings: &mut Findings,
+) {
+    for (name, meta) in dependencies {
+        let mut chain = parent_chain.clone();
+        chain.push(name.clone());
+
+        if profile.related_package_names.iter().any(|n| *n == name.as_str()) {
+            let version = meta.get("version").and_then(|v| v.as_str()).unwrap_or("unknown");
+            findings.manifest_hits.push(ManifestHit {
+                path: file.display().to_string(),
+                line_number: 0,
+                line: format!("dependencies.{} = {}", chain.join(" > "), version),
+                pinned_version: Some(version.to_string()),
+                match_kind: ManifestMatchKind::PinnedReference,
+            });
+            findings.version_hits.push(VersionHit {
+                path: file.display().to_string(),
+                line_number: 0,
+                line: format!("dependencies.{} = {}", chain.join(" > "), version),
+                version: version.to_string(),
+                status: classify_version(profile, version),
+            });
+        }
+
+        if let Some(children) = meta.get("dependencies").and_then(|v| v.as_object()) {
+            collect_package_lock_dependencies(profile, file, children, chain, findings);
+        }
+    }
+}
+
+fn scan_environment(profile: &IncidentProfile, target: &Path, limitations: &mut Limitations) -> Result<PythonEnvScan> {
+    match profile.ecosystem {
+        "python" => scan_python_environment(profile, limitations),
+        "npm" => scan_npm_environment(profile, target, limitations),
+        _ => Ok(PythonEnvScan::default()),
+    }
 }
 
 fn scan_python_environment(profile: &IncidentProfile, limitations: &mut Limitations) -> Result<PythonEnvScan> {
@@ -723,6 +861,57 @@ fn scan_python_environment(profile: &IncidentProfile, limitations: &mut Limitati
     }
 
     result.cache_hits.extend(scan_cache_hits(profile.package, &env_paths, limitations)?);
+    result.ioc_file_hits.extend(search_ioc_files(&env_paths, profile.ioc_files, limitations, true)?);
+
+    Ok(result)
+}
+
+fn scan_npm_environment(profile: &IncidentProfile, target: &Path, limitations: &mut Limitations) -> Result<PythonEnvScan> {
+    let mut result = PythonEnvScan::default();
+
+    if !command_exists("npm") {
+        push_limited(&mut limitations.missing_tools, "npm".to_string());
+        result.skipped_checks.push(SkippedCheck {
+            check: "npm_environment".to_string(),
+            reason: "npm was not found".to_string(),
+        });
+        return Ok(result);
+    }
+
+    let target_has_node_context = target.join("package.json").exists()
+        || target.join("package-lock.json").exists()
+        || target.join("yarn.lock").exists()
+        || target.join("pnpm-lock.yaml").exists()
+        || target.join("node_modules").exists();
+
+    if target_has_node_context {
+        collect_npm_ls_findings(profile, target, false, &mut result);
+        if let Some(dep) = profile.malicious_dependency {
+            collect_npm_dependency_findings(profile, target, dep, "npm_ls_malicious_dep", false, &mut result);
+        }
+    } else {
+        result.skipped_checks.push(SkippedCheck {
+            check: "npm_ls".to_string(),
+            reason: format!("target {} does not look like a Node/npm project", target.display()),
+        });
+    }
+
+    collect_npm_ls_findings(profile, Path::new("/"), true, &mut result);
+    if let Some(dep) = profile.malicious_dependency {
+        collect_npm_dependency_findings(profile, Path::new("/"), dep, "npm_ls_global_malicious_dep", true, &mut result);
+    }
+
+    let mut env_paths = Vec::new();
+    if let Some(home) = home_dir() {
+        env_paths.push(home.join(".npm/_cacache/index-v5"));
+        env_paths.push(home.join(".npm/_cacache"));
+        env_paths.push(home.join(".npm"));
+    }
+
+    result.cache_hits.extend(scan_cache_hits(profile.package, &env_paths, limitations)?);
+    if let Some(dep) = profile.malicious_dependency {
+        result.cache_hits.extend(scan_cache_hits(dep, &env_paths, limitations)?);
+    }
     result.ioc_file_hits.extend(search_ioc_files(&env_paths, profile.ioc_files, limitations, true)?);
 
     Ok(result)
@@ -1001,7 +1190,7 @@ fn search_ioc_files(
 }
 
 fn explain_report(profile: &IncidentProfile, report: &ScanReport, config: &LlmConfig) -> Result<ExplainOutput> {
-    let system_prompt = build_explainer_system_prompt();
+    let system_prompt = build_explainer_system_prompt(profile);
     let user_prompt = build_explainer_user_prompt(profile, report)?;
     let explanation = match config.provider {
         LlmProvider::Anthropic => call_anthropic(config, &system_prompt, &user_prompt)?,
@@ -1125,9 +1314,9 @@ fn call_gemini(config: &LlmConfig, system_prompt: &str, user_prompt: &str) -> Re
     Ok(text)
 }
 
-fn build_explainer_system_prompt() -> String {
+fn build_explainer_system_prompt(profile: &IncidentProfile) -> String {
     format!(
-        "You are SCIRA, an incident-response agent for Python/PyPI supply chain incidents.\n\
+        "You are SCIRA, an incident-response agent for software supply chain incidents.\n\
 Your job is to explain a deterministic scan report without inventing evidence.\n\
 Rules:\n\
 - Treat the JSON report as the source of truth.\n\
@@ -1139,8 +1328,8 @@ Rules:\n\
 \nBundled skill context:\n\
 --- SKILL.md ---\n{}\n\
 --- IOC patterns ---\n{}",
-        excerpt(BUNDLED_SKILL_MD, 7000),
-        excerpt(BUNDLED_IOC_PATTERNS_MD, 5000)
+        excerpt(profile.bundled_skill_md, 7000),
+        excerpt(profile.bundled_ioc_patterns_md, 5000)
     )
 }
 
@@ -1157,16 +1346,20 @@ Return these exact sections in order:\n\
 6. Unknowns and what to verify\n\
 7. Verification warning\n\
 \nIncident profile:\n\
+- ecosystem: {}\n\
 - package: {}\n\
 - bad versions: {}\n\
 - safe version: {}\n\
+- malicious dependency: {}\n\
 - IOC domains: {}\n\
 - IOC files: {}\n\
 \nDeterministic report JSON:\n{}",
         profile.id,
+        profile.ecosystem,
         profile.package,
         profile.bad_versions.join(", "),
         profile.safe_version,
+        profile.malicious_dependency.unwrap_or("none"),
         profile.ioc_domains.join(", "),
         profile.ioc_files.join(", "),
         report_json
@@ -1259,6 +1452,8 @@ fn incident_profile(id: &str) -> Result<IncidentProfile> {
             package: "litellm",
             bad_versions: &["1.82.7", "1.82.8"],
             safe_version: "1.82.6",
+            malicious_dependency: None,
+            related_package_names: &["litellm"],
             ioc_domains: &["models.litellm.cloud", "checkmarx.zone"],
             ioc_files: &["litellm_init.pth"],
             search_patterns: &[
@@ -1292,9 +1487,51 @@ fn incident_profile(id: &str) -> Result<IncidentProfile> {
             source_repo: "https://github.com/makash/agent-infra-security",
             source_skill: "pypi-supply-chain-response",
             source_version: "2026-03-25",
+            bundled_skill_md: BUNDLED_PYPI_SKILL_MD,
+            bundled_ioc_patterns_md: BUNDLED_PYPI_IOC_PATTERNS_MD,
+        }),
+        "axios" | "axios-npm" => Ok(IncidentProfile {
+            id: "axios",
+            title: "Axios npm compromise",
+            ecosystem: "npm",
+            package: "axios",
+            bad_versions: &["1.14.1", "0.30.4", "4.2.0", "4.2.1"],
+            safe_version: "1.14.0 / 0.30.3",
+            malicious_dependency: Some("plain-crypto-js"),
+            related_package_names: &["axios", "plain-crypto-js"],
+            ioc_domains: &["sfrclak.com", "http://sfrclak.com:8000/"],
+            ioc_files: &["com.apple.act.mond", "ld.py", "wt.exe"],
+            search_patterns: &[
+                "package.json",
+                "package-lock.json",
+                "yarn.lock",
+                "pnpm-lock.yaml",
+                "npm-shrinkwrap.json",
+                "Dockerfile",
+                "*.log",
+            ],
+            immediate_next_steps: &[
+                "Isolate the affected host, user context, or CI runner if the compromised axios version or malicious dependency was installed.",
+                "Preserve npm evidence before cleanup: npm ls output, lockfiles, and any suspicious node_modules/plain-crypto-js files.",
+                "Check whether plain-crypto-js was introduced transitively and whether postinstall execution occurred on this machine or in CI.",
+            ],
+            credential_rotation_scope: &[
+                "Rotate npm tokens, cloud credentials, Git tokens, SSH keys, Docker auth, and any secrets available during npm install.",
+                "Audit provider and CI logs to confirm whether those credentials were used after the compromise window.",
+            ],
+            cleanup_and_rebuild: &[
+                "Remove the malicious dependency and purge npm cache so compromised tarballs are not silently reused.",
+                "Inspect for anti-forensics indicators like package.md swaps or self-deleting setup.js behavior in node_modules/plain-crypto-js.",
+                "Rebuild from a known-good dependency state, pinning axios to 1.14.0 or 0.30.3 as appropriate.",
+            ],
+            source_repo: "https://github.com/makash/agent-infra-security",
+            source_skill: "npm-supply-chain-response",
+            source_version: "2026-03-31",
+            bundled_skill_md: BUNDLED_NPM_SKILL_MD,
+            bundled_ioc_patterns_md: BUNDLED_NPM_IOC_PATTERNS_MD,
         }),
         other => Err(anyhow!(
-            "unsupported incident `{other}`. First cut supports only `litellm`."
+            "unsupported incident `{other}`. Current built-in incidents: `litellm`, `axios`."
         )),
     }
 }
@@ -1424,6 +1661,136 @@ fn prompt_yes_no(prompt: &str, default_yes: bool) -> Result<bool> {
     Ok(matches!(trimmed.as_str(), "y" | "yes"))
 }
 
+fn collect_npm_ls_findings(profile: &IncidentProfile, target: &Path, global: bool, result: &mut PythonEnvScan) {
+    collect_npm_dependency_findings(
+        profile,
+        target,
+        profile.package,
+        if global { "npm_ls_global" } else { "npm_ls" },
+        global,
+        result,
+    );
+}
+
+fn collect_npm_dependency_findings(
+    profile: &IncidentProfile,
+    target: &Path,
+    package: &str,
+    check: &str,
+    global: bool,
+    result: &mut PythonEnvScan,
+) {
+    let args = if global {
+        vec!["ls", "-g", "--depth=0", package, "--json"]
+    } else {
+        vec!["ls", package, "--all", "--json"]
+    };
+
+    match run_command_capture_in_dir("npm", &args, if global { None } else { Some(target) }) {
+        Ok(output) if output.status.success() || !output.stdout.trim().is_empty() => {
+            let matches = parse_npm_ls_versions(&output.stdout, package, profile.bad_versions);
+            if matches.is_empty() {
+                result.findings.push(EnvironmentFinding {
+                    check: check.to_string(),
+                    status: "not_present".to_string(),
+                    details: format!("Package {package} not found via npm ls"),
+                    version: None,
+                    bad_version: false,
+                    raw: None,
+                });
+            } else {
+                for npm_match in matches {
+                    result.findings.push(EnvironmentFinding {
+                        check: check.to_string(),
+                        status: "present".to_string(),
+                        details: if global {
+                            format!("Global npm package {package} found{}", npm_match.path_hint.as_deref().map(|p| format!(" via {p}")).unwrap_or_default())
+                        } else {
+                            format!("npm dependency {package} found{}", npm_match.path_hint.as_deref().map(|p| format!(" via {p}")).unwrap_or_default())
+                        },
+                        bad_version: npm_match.bad_version,
+                        version: Some(npm_match.version),
+                        raw: None,
+                    });
+                }
+            }
+        }
+        Ok(output) => {
+            result.findings.push(EnvironmentFinding {
+                check: check.to_string(),
+                status: "not_present".to_string(),
+                details: format!("Package {package} not found via npm ls"),
+                version: None,
+                bad_version: false,
+                raw: if output.stderr.trim().is_empty() { None } else { Some(output.stderr) },
+            });
+        }
+        Err(err) => result.skipped_checks.push(SkippedCheck {
+            check: check.to_string(),
+            reason: err.to_string(),
+        }),
+    }
+}
+
+#[derive(Debug)]
+struct NpmMatch {
+    version: String,
+    bad_version: bool,
+    path_hint: Option<String>,
+}
+
+fn parse_npm_ls_versions(output: &str, package: &str, bad_versions: &[&str]) -> Vec<NpmMatch> {
+    let Ok(json) = serde_json::from_str::<Value>(output) else {
+        return Vec::new();
+    };
+    let mut matches = Vec::new();
+    collect_npm_matches_from_value(&json, package, bad_versions, &mut Vec::new(), &mut matches);
+    matches
+}
+
+fn collect_npm_matches_from_value(value: &Value, package: &str, bad_versions: &[&str], stack: &mut Vec<String>, matches: &mut Vec<NpmMatch>) {
+    if let Some(name) = value.get("name").and_then(|v| v.as_str()) {
+        if !name.is_empty() {
+            stack.push(name.to_string());
+        }
+    }
+
+    let current_name = value.get("name").and_then(|v| v.as_str());
+    let current_version = value.get("version").and_then(|v| v.as_str());
+    if current_name == Some(package) {
+        if let Some(version) = current_version {
+            matches.push(NpmMatch {
+                version: version.to_string(),
+                bad_version: bad_versions.iter().any(|bad| *bad == version),
+                path_hint: if stack.is_empty() { None } else { Some(stack.join(" > ")) },
+            });
+        }
+    }
+
+    if let Some(dependencies) = value.get("dependencies").and_then(|v| v.as_object()) {
+        for (dep_name, dep_value) in dependencies {
+            if dep_name == package {
+                let version = dep_value
+                    .get("version")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let mut path_stack = stack.clone();
+                path_stack.push(dep_name.clone());
+                matches.push(NpmMatch {
+                    version: version.to_string(),
+                    bad_version: bad_versions.iter().any(|bad| *bad == version),
+                    path_hint: Some(path_stack.join(" > ")),
+                });
+            }
+            collect_npm_matches_from_value(dep_value, package, bad_versions, stack, matches);
+        }
+    }
+
+    if current_name.is_some() {
+        let _ = stack.pop();
+    }
+}
+
 fn detect_python() -> Option<String> {
     if command_exists("python") {
         Some("python".to_string())
@@ -1443,7 +1810,16 @@ fn command_exists(command: &str) -> bool {
 }
 
 fn run_command_capture(command: &str, args: &[&str]) -> io::Result<CommandOutput> {
-    let output = Command::new(command).args(args).output()?;
+    run_command_capture_in_dir(command, args, None)
+}
+
+fn run_command_capture_in_dir(command: &str, args: &[&str], dir: Option<&Path>) -> io::Result<CommandOutput> {
+    let mut cmd = Command::new(command);
+    cmd.args(args);
+    if let Some(dir) = dir {
+        cmd.current_dir(dir);
+    }
+    let output = cmd.output()?;
     Ok(CommandOutput {
         status: output.status,
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
@@ -1496,11 +1872,32 @@ fn build_matcher(patterns: &[&str]) -> Result<GlobSet> {
 fn classify_version(profile: &IncidentProfile, version: &str) -> VersionHitStatus {
     if profile.bad_versions.iter().any(|bad| bad == &version) {
         VersionHitStatus::Compromised
-    } else if profile.safe_version == version {
+    } else if profile
+        .safe_version
+        .split('/')
+        .map(|v| v.trim())
+        .any(|safe| safe == version)
+    {
         VersionHitStatus::Safe
     } else {
         VersionHitStatus::Other
     }
+}
+
+fn is_exact_npm_version(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('^')
+        && !value.starts_with('~')
+        && !value.starts_with('>')
+        && !value.starts_with('<')
+        && !value.starts_with('*')
+        && !value.contains(" ")
+        && !value.contains("||")
+        && !value.contains(':')
+        && !value.starts_with("workspace:")
+        && !value.starts_with("file:")
+        && !value.starts_with("git+")
+        && value.chars().any(|c| c.is_ascii_digit())
 }
 
 fn push_limited(items: &mut Vec<String>, value: String) {

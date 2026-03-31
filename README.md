@@ -2,13 +2,13 @@
 
 **SCIRA** stands for **Supply Chain Incident Response Agent**.
 
-`scira` is a single-binary host/folder incident-response agent for Python/PyPI supply chain incidents.
+`scira` is a single-binary host/folder incident-response agent for software supply chain incidents, starting with PyPI and npm.
 
-For the first cut, it bundles the `pypi-supply-chain-response` expertise from [agent-infra-security](https://github.com/makash/agent-infra-security) and ships with a built-in `litellm` incident flow.
+For the first cut, it bundles ecosystem-specific incident-response expertise from [agent-infra-security](https://github.com/makash/agent-infra-security) and ships with built-in `litellm` and `axios` incident flows.
 
 ![SCIRA demo](assets/demo.gif)
 
-*A quick scan → explain flow for the bundled LiteLLM incident.*
+*A quick scan → explain flow for one of SCIRA's built-in incidents.*
 
 ## Why SCIRA?
 
@@ -25,7 +25,7 @@ SCIRA takes a different approach:
 - **Structured output** — human-readable summary, JSON report, and meaningful exit codes
 - **Agentic workflow** — deterministic scan first, optional AI explanation second
 - **Offline-capable scanning** — the core scan does not need network access
-- **Built to grow** — first cut ships with `litellm`, but the model is designed for more incident profiles over time
+- **Built to grow** — current built-in incidents are `litellm` and `axios`, and the model is designed for more incident profiles over time
 
 ## What it does
 
@@ -40,7 +40,7 @@ SCIRA takes a different approach:
 
 ```bash
 scira scan litellm
-scira scan litellm --target /srv/app
+scira scan axios --target /srv/app
 scira scan litellm --all-dirs
 ```
 
@@ -100,7 +100,7 @@ Download the right binary from the [SCIRA GitHub Releases page](https://github.c
 ### macOS (Apple Silicon)
 
 ```bash
-curl -L -o scira https://github.com/makash/scira/releases/download/v0.1.0/scira-darwin-arm64
+curl -L -o scira https://github.com/makash/scira/releases/download/v0.1.1/scira-darwin-arm64
 chmod +x scira
 xattr -d com.apple.quarantine ./scira 2>/dev/null || true
 ./scira scan litellm
@@ -109,7 +109,7 @@ xattr -d com.apple.quarantine ./scira 2>/dev/null || true
 ### macOS (Intel)
 
 ```bash
-curl -L -o scira https://github.com/makash/scira/releases/download/v0.1.0/scira-darwin-amd64
+curl -L -o scira https://github.com/makash/scira/releases/download/v0.1.1/scira-darwin-amd64
 chmod +x scira
 xattr -d com.apple.quarantine ./scira 2>/dev/null || true
 ./scira scan litellm
@@ -157,7 +157,7 @@ If `scira` later adds code signing and notarization, this manual step should dis
 ### Linux (x86_64)
 
 ```bash
-curl -L -o scira https://github.com/makash/scira/releases/download/v0.1.0/scira-linux-amd64
+curl -L -o scira https://github.com/makash/scira/releases/download/v0.1.1/scira-linux-amd64
 chmod +x scira
 ./scira scan litellm
 ```
@@ -226,14 +226,16 @@ The binary name is:
 This repo bundles local copies of:
 - `bundled/pypi-supply-chain-response/SKILL.md`
 - `bundled/pypi-supply-chain-response/references/ioc-patterns.md`
+- `bundled/npm-supply-chain-response/SKILL.md`
+- `bundled/npm-supply-chain-response/references/ioc-patterns.md`
 
-Those are used as explanation context so the runtime stays aligned with the marketplace skill while keeping deterministic scanning logic in Rust.
+Those are used as explanation context so the runtime stays aligned with the marketplace skills while keeping deterministic scanning logic in Rust.
 
 ## Current scope
 
 This first cut is intentionally narrow:
-- one built-in incident: `litellm`
-- one ecosystem focus: PyPI / Python
+- two built-in incidents: `litellm`, `axios`
+- two ecosystem starting points: PyPI / Python and npm / Node.js
 - host/folder CLI first
 
 Later versions can add more bundled incidents and broader ecosystem coverage.
