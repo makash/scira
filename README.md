@@ -4,11 +4,12 @@
 
 `scira` is a single-binary host/folder incident-response agent for software supply chain incidents, starting with PyPI and npm.
 
-Out of the box, SCIRA helps you respond to two major supply chain incidents:
+Out of the box, SCIRA helps you respond to two major package supply chain incidents and one MCP configuration risk profile:
 - **LiteLLM on PyPI** — detect compromised `litellm` versions, IOC domains, IOC files, and Python environment evidence
 - **Axios on npm** — detect compromised `axios` versions, the malicious `plain-crypto-js` dependency, IOC domains, and Node/npm environment evidence
+- **MCP STDIO configs** — inventory local MCP servers and flag shell execution, package-runner execution, unpinned runtime resolution, and credential exposure risk
 
-For the first cut, it bundles ecosystem-specific incident-response expertise from [agent-infra-security](https://github.com/makash/agent-infra-security) and ships with built-in `litellm` and `axios` incident flows.
+For the first cut, it bundles ecosystem-specific incident-response expertise from [agent-infra-security](https://github.com/makash/agent-infra-security) and ships with built-in `litellm`, `axios`, and `mcp-stdio` incident flows.
 
 ![SCIRA demo](assets/demo.gif)
 
@@ -34,6 +35,25 @@ SCIRA takes a different approach:
 
 ## Built-in incident response
 
+### Host runtime advisories (October 2026 wave)
+Use SCIRA to audit a whole host for the October 2026 security wave. These profiles
+detect installed runtimes host-wide (PATH, dpkg, per-user installs like nvm/volta,
+running Docker containers, and Docker image metadata), compare them against the
+advisory fixed versions, and for eMudhra check TLS trust stores for the
+distrusted root.
+
+```bash
+sudo scira scan node --all-dirs     # Node.js Oct 2026 security releases (Brotli RCE, TLS/DNS bypasses, eMudhra CA update)
+sudo scira scan php --all-dirs      # PHP "PHP2Shell" CVE-2026-109618 / CVE-2026-109619 critical RCEs
+sudo scira scan brotli --all-dirs   # Brotli decoder OOB write RCE, CVE-2026-111497 (1.0.3–1.2.0)
+sudo scira scan emudhra --all-dirs  # eMudhra emSign intermediate CA compromise (distrusted emSign ECC Root CA - G3)
+```
+
+Each profile knows the fixed versions per release line (PHP 8.2.35/8.3.36/8.4.27/8.5.12,
+Node 22.23.4/24.22.1/26.12.1, Brotli 1.0.10/1.1.1/1.2.1) and flags EOL lines as
+vulnerable. Bundled response expertise and IOC tables live in
+`bundled/host-runtime-response/`.
+
 ### LiteLLM on PyPI
 Use SCIRA to check whether a host, repo, or user environment was affected by the LiteLLM compromise.
 
@@ -54,6 +74,17 @@ SCIRA looks for:
 - IOC domains like `sfrclak.com`
 - installed-package evidence from npm environments and caches
 
+### MCP STDIO configuration risk
+Use SCIRA to inventory local MCP server configs and find command-execution or supply-chain risk before trusting an AI client, laptop, or developer workstation.
+
+SCIRA looks for:
+- MCP config files like `.mcp.json`, `.vscode/mcp.json`, `mcp.json`, `claude_desktop_config.json`, and `mcp_config.json`
+- Docker and Compose surfaces like `Dockerfile`, `docker-compose.yml`, `compose.yml`, mounted MCP configs, container commands, env keys, ports, and local Docker runtime metadata when available
+- STDIO servers that execute shells like `bash -c`, `sh -c`, `cmd /c`, or PowerShell command strings
+- package-runner launchers like `npx -c`, plus unpinned `npx`, `uvx`, `pipx`, `bunx`, and `pnpx` servers
+- project-scoped MCP configs that may be editable by local tools or agents
+- credential-bearing paths or names such as `.ssh`, `.aws`, `.kube`, `.npmrc`, `docker.sock`, tokens, and API keys
+
 ## What it does
 
 - scans a target folder or broad host-visible paths
@@ -68,6 +99,7 @@ SCIRA looks for:
 ```bash
 scira scan litellm
 scira scan axios --target /srv/app
+scira scan mcp-stdio --target ~
 scira scan litellm --all-dirs
 scira scan axios --format json --output axios-report.json
 ```
@@ -226,6 +258,7 @@ SCIRA is designed to keep evidence collection and reasoning separate.
 - **Deterministic scan results are the source of truth**
 - **AI explanation is optional and advisory**
 - **Core scanning is local-first and offline-capable**
+- **MCP Docker inspection is metadata-only** — no registry lookups, no network calls, no `docker exec`, and no container filesystem traversal
 - **Nothing leaves the machine unless you explicitly enable an LLM-backed explanation**
 
 That means you can use SCIRA as a plain local incident-response CLI, or as a more agentic tool when you want help interpreting findings.
@@ -256,14 +289,17 @@ This repo bundles local copies of:
 - `bundled/pypi-supply-chain-response/references/ioc-patterns.md`
 - `bundled/npm-supply-chain-response/SKILL.md`
 - `bundled/npm-supply-chain-response/references/ioc-patterns.md`
+- `bundled/mcp-supply-chain-response/SKILL.md`
+- `bundled/mcp-supply-chain-response/references/ioc-patterns.md`
 
 Those are used as explanation context so the runtime stays aligned with the marketplace skills while keeping deterministic scanning logic in Rust.
 
 ## Current scope
 
 This first cut is intentionally narrow:
-- two built-in incidents: `litellm`, `axios`
-- two ecosystem starting points: PyPI / Python and npm / Node.js
+- two built-in package incidents: `litellm`, `axios`
+- one built-in MCP local config profile: `mcp-stdio`
+- ecosystem starting points: PyPI / Python, npm / Node.js, local MCP server configuration, and local Docker/Compose metadata
 - host/folder CLI first
 
-Later versions can add more bundled incidents and broader ecosystem coverage.
+Later versions can add more bundled incidents, offline advisory data, and broader ecosystem coverage.
