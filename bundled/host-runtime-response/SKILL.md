@@ -70,6 +70,34 @@ Docker image metadata, Python environments, and TLS trust stores.
   until their store is refreshed.
 - eMudhra's digital-signature/eSign services (emSigner) were not affected.
 
+## Advisory 5: Playwright ecosystem (bundled browsers, @playwright/mcp)
+
+- Playwright core (npm `playwright`, pip `playwright`) has no published core
+  advisories, but:
+  - CVE-2025-59288 (GHSA-7mvr-c777-76hp, GHSA-qxm8-4v54-964r): browser
+    installer scripts used `curl -k`, allowing MITM delivery of arbitrary
+    browser binaries. Affected < 1.55.1 and the 1.55.1 release itself;
+    fixed in 1.56.0.
+  - playwright 1.64.x bundles Firefox r1555 = Firefox 157.0, affected by
+    CVE-2026-106016 (Mozilla MFSA 2026-104 rates it Moderate; NVD carries 9.8
+    from a worst-case CISA score). Playwright will not ship a 1.64.2; the fix
+    (Firefox 158) ships in 1.65. Playwright's download handling already
+    cancels/renames downloads, which the maintainer considers mitigating.
+- Cached browser builds are a separate exposure: Chromium 145.0.7632.6
+  (cached by playwright 1.5x installs, build chromium-1208 era) is vulnerable
+  to CVE-2026-2441, an actively exploited Chromium use-after-free fixed in
+  145.0.7632.75. Old caches survive package upgrades, so audit
+  `~/.cache/ms-playwright` per user.
+- `@playwright/mcp` < 0.0.40: CVE-2025-9611 (GHSA-6fg3-hvw7-2fwq) — no Origin
+  header validation, so a visited webpage can DNS-rebind to the local MCP
+  server and invoke every tool. Fixed in 0.0.40.
+- Adjacent products (scan only if present): Open WebUI with
+  `WEB_LOADER_ENGINE=playwright` (CVE-2026-87996 / CVE-2026-70479, fixed
+  0.11.1), n8n Browser Use upload tool (GHSA-9qx8-fhxv-w794, fixed
+  2.46.1/2.45.5/3.0.1), Firecrawl < 2.11.586 SSRF, browserless
+  CVE-2026-92811 (< 2.56.8), Lookyloo PlaywrightCapture < 1.39.6
+  (CVE-2026-44439).
+
 ## Response priorities
 
 1. Inventory first: enumerate every PHP/Node/Brotli install on the host,

@@ -47,6 +47,7 @@ sudo scira scan node --all-dirs     # Node.js Oct 2026 security releases (Brotli
 sudo scira scan php --all-dirs      # PHP "PHP2Shell" CVE-2026-109618 / CVE-2026-109619 critical RCEs
 sudo scira scan brotli --all-dirs   # Brotli decoder OOB write RCE, CVE-2026-111497 (1.0.3–1.2.0)
 sudo scira scan emudhra --all-dirs  # eMudhra emSign intermediate CA compromise (distrusted emSign ECC Root CA - G3)
+sudo scira scan playwright --all-dirs  # Playwright: core/\@playwright\/mcp versions + cached Chromium/Firefox builds (CVE-2025-59288, CVE-2026-2441, CVE-2026-106016, CVE-2025-9611)
 ```
 
 Each profile knows the fixed versions per release line (PHP 8.2.35/8.3.36/8.4.27/8.5.12,

@@ -70,7 +70,7 @@ enum Commands {
 #[derive(Args, Debug)]
 struct ScanArgs {
     /// Bundled incident identifier. Current built-ins: litellm, axios, mcp-stdio,
-    /// php, node, brotli, emudhra
+    /// php, node, brotli, emudhra, playwright
     incident: String,
 
     /// Scan this target path. Defaults to the current directory.
@@ -2420,6 +2420,7 @@ fn scan_host_runtime(
         "node" => Ok(scan_host_node(advisory, findings, limitations)),
         "brotli" => Ok(scan_host_brotli(advisory, findings, limitations)),
         "emudhra" => Ok(scan_host_emudhra(findings, limitations)),
+        "playwright" => Ok(scan_host_playwright(findings, limitations)),
         other => Err(anyhow!("unsupported host advisory kind `{other}`")),
     }
 }
@@ -3239,6 +3240,372 @@ fn scan_host_emudhra(findings: &mut Findings, limitations: &mut Limitations) {
     } else {
         note_docker_unavailable(limitations, true);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Playwright ecosystem advisory scan
+// ---------------------------------------------------------------------------
+
+fn read_package_json_version(path: &Path) -> Option<String> {
+    let content = fs::read_to_string(path).ok()?;
+    let value: Value = serde_json::from_str(&content).ok()?;
+    value
+        .get("version")?
+        .as_str()
+        .map(|version| version.trim().to_string())
+        .filter(|version| !version.is_empty())
+}
+
+fn find_playwright_install_dirs() -> Vec<PathBuf> {
+    // Locate node_modules/playwright and node_modules/@playwright/mcp across
+    // user homes, root, and global npm roots. `find` keeps this fast on big
+    // home trees; missing roots are tolerated.
+    let mut found: BTreeSet<PathBuf> = BTreeSet::new();
+    let roots = [
+        "/home",
+        "/root",
+        "/usr/local/lib/node_modules",
+        "/usr/lib/node_modules",
+    ];
+    let existing: Vec<&str> = roots
+        .iter()
+        .copied()
+        .filter(|root| Path::new(root).is_dir())
+        .collect();
+    if existing.is_empty() {
+        return Vec::new();
+    }
+    let mut args: Vec<&str> = vec!["-H"];
+    args.extend(existing.iter().copied());
+    args.extend([
+        "-maxdepth",
+        "9",
+        "-type",
+        "d",
+        "-name",
+        "playwright",
+        "-path",
+        "*node_modules*",
+    ]);
+    if let Ok(output) = run_command_capture("find", &args) {
+        for line in output.stdout.lines() {
+            let path = PathBuf::from(line.trim());
+            if path
+                .parent()
+                .map(|parent| parent.file_name().map(|n| n == "node_modules").unwrap_or(false))
+                .unwrap_or(false)
+                && path.is_dir()
+            {
+                found.insert(path);
+            }
+        }
+    }
+    let mut mcp_args: Vec<&str> = vec!["-H"];
+    mcp_args.extend(existing.iter().copied());
+    mcp_args.extend([
+        "-maxdepth",
+        "9",
+        "-type",
+        "d",
+        "-name",
+        "mcp",
+        "-path",
+        "*@playwright*",
+    ]);
+    if let Ok(output) = run_command_capture("find", &mcp_args) {
+        for line in output.stdout.lines() {
+            let path = PathBuf::from(line.trim());
+            if path
+                .parent()
+                .map(|parent| parent.file_name().map(|n| n == "@playwright").unwrap_or(false))
+                .unwrap_or(false)
+                && path.is_dir()
+            {
+                found.insert(path);
+            }
+        }
+    }
+    found.into_iter().collect()
+}
+
+fn home_of_path(path: &Path) -> Option<String> {
+    let mut components = path.components();
+    if components.next()?.as_os_str() != "home" {
+        return None;
+    }
+    components
+        .next()
+        .map(|component| component.as_os_str().to_string_lossy().to_string())
+}
+
+fn parse_trailing_version(output: &str) -> Option<String> {
+    output
+        .lines()
+        .map(str::trim)
+        .find(|line| line.chars().rev().any(|c| c.is_ascii_digit()))
+        .and_then(|line| line.split_whitespace().last())
+        .map(|token| token.trim().to_string())
+        .filter(|token| token.chars().next().is_some_and(|c| c.is_ascii_digit()))
+}
+
+fn scan_cached_browser_builds(findings: &mut Findings, limitations: &mut Limitations) {
+    let mut cache_roots: Vec<PathBuf> = Vec::new();
+    if let Ok(homes) = fs::read_dir("/home") {
+        for home in homes.flatten() {
+            cache_roots.push(home.path().join(".cache/ms-playwright"));
+        }
+    }
+    cache_roots.push(PathBuf::from("/root/.cache/ms-playwright"));
+
+    for cache_root in &cache_roots {
+        let entries = match fs::read_dir(cache_root) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            let name = dir
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let is_chromium = name.starts_with("chromium") && !name.contains("_driver");
+            let is_firefox = name.starts_with("firefox");
+            if !is_chromium && !is_firefox {
+                continue;
+            }
+            // Full builds use chrome-linux64/chrome (older: chrome-linux);
+            // headless-shell-only builds ship a headless_shell binary instead.
+            let binary_candidates = if is_chromium {
+                vec![
+                    dir.join("chrome-linux64/chrome"),
+                    dir.join("chrome-linux/chrome"),
+                    dir.join("chrome-headless-shell-linux64/chrome-headless-shell"),
+                    dir.join("chrome-headless-shell-linux/chrome-headless-shell"),
+                ]
+            } else {
+                vec![dir.join("firefox/firefox")]
+            };
+            let binary = binary_candidates
+                .into_iter()
+                .find(|binary| binary.is_file());
+            let Some(binary) = binary else {
+                limitations
+                    .not_inspected
+                    .push(format!("{} has no browser binary", dir.display()));
+                continue;
+            };
+            let Ok(output) = run_command_capture(&binary.to_string_lossy(), &["--version"]) else {
+                continue;
+            };
+            let Some(version) = parse_trailing_version(&output.stdout) else {
+                continue;
+            };
+            if is_chromium {
+                // CVE-2026-2441: actively exploited Chromium UAF, fixed 145.0.7632.75.
+                if version.starts_with("145.0.7632.")
+                    && version_cmp(&version, "145.0.7632.75") == std::cmp::Ordering::Less
+                {
+                    findings.version_hits.push(VersionHit {
+                        path: binary.to_string_lossy().to_string(),
+                        line_number: 0,
+                        line: format!(
+                            "cached browser Chromium {version}; vulnerable to CVE-2026-2441 (fixed 145.0.7632.75)"
+                        ),
+                        version,
+                        status: VersionHitStatus::Compromised,
+                    });
+                }
+            } else if version_cmp(&version, "157.0.1") == std::cmp::Ordering::Less
+                && version.starts_with("157.")
+            {
+                // CVE-2026-106016: Firefox 157.0 file handling, fixed 157.0.1
+                // (bundled by playwright 1.64.x; no 1.64 patch planned).
+                findings.version_hits.push(VersionHit {
+                    path: binary.to_string_lossy().to_string(),
+                    line_number: 0,
+                    line: format!(
+                        "cached browser Firefox {version}; vulnerable to CVE-2026-106016 (fixed 157.0.1)"
+                    ),
+                    version,
+                    status: VersionHitStatus::Compromised,
+                });
+            }
+        }
+    }
+}
+
+fn scan_host_playwright(findings: &mut Findings, limitations: &mut Limitations) {
+    let installs = find_playwright_install_dirs();
+    if installs.is_empty() {
+        limitations
+            .not_inspected
+            .push("no playwright or @playwright/mcp installs found under /home, /root, or global node_modules".to_string());
+    }
+
+    for install in installs {
+        let Some(version) = read_package_json_version(&install.join("package.json")) else {
+            limitations
+                .permission_denied_paths
+                .push(install.to_string_lossy().to_string());
+            continue;
+        };
+        let name = install
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "playwright".to_string());
+        let package = if name == "mcp" { "@playwright/mcp" } else { "playwright" };
+        let source = if install.to_string_lossy().contains(".npm/_npx") {
+            "npx cache"
+        } else {
+            "npm install"
+        };
+
+        if package == "@playwright/mcp" {
+            if version_cmp(&version, "0.0.40") == std::cmp::Ordering::Less {
+                findings.version_hits.push(VersionHit {
+                    path: install.to_string_lossy().to_string(),
+                    line_number: 0,
+                    line: format!(
+                        "detected {package} {version} via {source}; vulnerable to CVE-2025-9611 DNS rebinding, fixed in 0.0.40"
+                    ),
+                    version,
+                    status: VersionHitStatus::Compromised,
+                });
+            } else {
+                findings.version_hits.push(VersionHit {
+                    path: install.to_string_lossy().to_string(),
+                    line_number: 0,
+                    line: format!(
+                        "detected {package} {version} via {source}; patched (fix was 0.0.40)"
+                    ),
+                    version,
+                    status: VersionHitStatus::Safe,
+                });
+            }
+            continue;
+        }
+
+        // playwright core package.
+        if version_cmp(&version, "1.56.0") == std::cmp::Ordering::Less {
+            findings.version_hits.push(VersionHit {
+                path: install.to_string_lossy().to_string(),
+                line_number: 0,
+                line: format!(
+                    "detected playwright {version} via {source}; vulnerable to CVE-2025-59288 insecure installer (curl -k), fixed in 1.56.0"
+                ),
+                version,
+                status: VersionHitStatus::Compromised,
+            });
+        } else if version.starts_with("1.64.") {
+            // Bundles Firefox r1555 = 157.0 (CVE-2026-106016); no 1.64.x patch planned.
+            let firefox_cached = home_of_path(&install)
+                .map(|user| {
+                    let cache = PathBuf::from(format!("/home/{user}/.cache/ms-playwright"));
+                    fs::read_dir(&cache)
+                        .map(|entries| {
+                            entries.flatten().any(|entry| {
+                                entry
+                                    .file_name()
+                                    .to_string_lossy()
+                                    .starts_with("firefox")
+                            })
+                        })
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            findings.environment_hits.push(EnvironmentFinding {
+                check: "playwright_firefox_bundle".to_string(),
+                status: "present".to_string(),
+                details: format!(
+                    "playwright {version} bundles Firefox 157.0 (CVE-2026-106016; Mozilla Moderate, NVD 9.8); Playwright will not patch 1.64.x — fixed in 1.65. {}",
+                    if firefox_cached {
+                        "A Firefox build IS downloaded in this user's cache, so the vulnerable browser is usable."
+                    } else {
+                        "No Firefox build is cached for this user, so the vulnerable browser is not currently usable."
+                    }
+                ),
+                version: Some(version.clone()),
+                bad_version: firefox_cached,
+                raw: None,
+            });
+            findings.version_hits.push(VersionHit {
+                path: install.to_string_lossy().to_string(),
+                line_number: 0,
+                line: format!(
+                    "detected playwright {version} via {source}; bundles Firefox 157.0 (CVE-2026-106016), unpatched on the 1.64 line — fixed in 1.65"
+                ),
+                version,
+                status: VersionHitStatus::Other,
+            });
+        } else {
+            findings.version_hits.push(VersionHit {
+                path: install.to_string_lossy().to_string(),
+                line_number: 0,
+                line: format!(
+                    "detected playwright {version} via {source}; no known core advisory for this version"
+                ),
+                version,
+                status: VersionHitStatus::Safe,
+            });
+        }
+    }
+
+    // Python playwright bindings share the npm versioning and browser cache.
+    let mut pythons: BTreeSet<String> = BTreeSet::new();
+    for candidate in ["python3", "/usr/bin/python3"] {
+        if run_command_capture(candidate, &["--version"])
+            .map(|out| out.status.success())
+            .unwrap_or(false)
+        {
+            pythons.insert(candidate.to_string());
+        }
+    }
+    for python in pythons {
+        if let Ok(output) = run_command_capture(&python, &["-m", "pip", "show", "playwright"]) {
+            if let Some(version) = parse_pip_show_field(&output.stdout, "Version") {
+                let bad = version_cmp(&version, "1.56.0") == std::cmp::Ordering::Less;
+                findings.environment_hits.push(EnvironmentFinding {
+                    check: "python_playwright".to_string(),
+                    status: "present".to_string(),
+                    details: format!(
+                        "{python} pip package playwright {version}{}",
+                        if bad {
+                            "; vulnerable to CVE-2025-59288, fixed in 1.56.0"
+                        } else {
+                            ""
+                        }
+                    ),
+                    version: Some(version),
+                    bad_version: bad,
+                    raw: None,
+                });
+            }
+        }
+    }
+
+    scan_cached_browser_builds(findings, limitations);
+
+    // Playwright-flavored docker images (e.g. mcr.microsoft.com/playwright).
+    if let Some(images) = docker_images() {
+        for image in images {
+            if image.to_lowercase().contains("playwright") {
+                findings.environment_hits.push(EnvironmentFinding {
+                    check: "docker_playwright_image".to_string(),
+                    status: "present".to_string(),
+                    details: format!(
+                        "docker image {image} looks playwright-based; verify bundled browser versions inside it"
+                    ),
+                    version: None,
+                    bad_version: false,
+                    raw: None,
+                });
+            }
+        }
+    }
+
+    limitations.notes.push(
+        "Playwright-adjacent product CVEs (Open WebUI Playwright loader, n8n Browser Use, Firecrawl, browserless) apply only if those products run here; this scan covers playwright itself, @playwright/mcp, and cached browser builds.".to_string(),
+    );
 }
 
 fn build_summary(findings: &Findings, limitations: &Limitations) -> Summary {
@@ -4252,8 +4619,46 @@ fn incident_profile(id: &str) -> Result<IncidentProfile> {
                 older_lines_vulnerable: false,
             }),
         }),
+        "playwright" | "playwright-ecosystem" => Ok(IncidentProfile {
+            id: "playwright",
+            title: "Playwright ecosystem advisories (bundled Chromium/Firefox CVEs, @playwright/mcp DNS rebinding)",
+            ecosystem: "host-runtime",
+            package: "playwright",
+            bad_versions: &[],
+            safe_version: "playwright >= 1.56.0 (>= 1.65 for a patched Firefox bundle), @playwright/mcp >= 0.0.40, cached Chromium >= 145.0.7632.75",
+            malicious_dependency: None,
+            related_package_names: &["playwright", "@playwright/mcp"],
+            ioc_domains: &[],
+            ioc_files: &[],
+            search_patterns: &[],
+            immediate_next_steps: &[
+                "Upgrade playwright installs below 1.56.0 (CVE-2025-59288: browser-installer scripts used curl -k, fixed GHSA-7mvr-c777-76hp / GHSA-qxm8-4v54-964r).",
+                "Delete cached Chromium 145.0.7632.6 browser builds (CVE-2026-2441, actively exploited use-after-free; fixed 145.0.7632.75) and re-run installs so nothing resolves the old build.",
+                "On playwright 1.64.x, the bundled Firefox 157.0 is affected by CVE-2026-106016 (Mozilla: Moderate; NVD: 9.8) and Playwright will not patch 1.64.x — move to 1.65+ or avoid installing Firefox on 1.64.x.",
+                "Upgrade @playwright/mcp below 0.0.40 (CVE-2025-9611: DNS rebinding via missing Origin-header validation gives a webpage access to all MCP server tools).",
+            ],
+            credential_rotation_scope: &[
+                "If an MCP client ran @playwright/mcp < 0.0.40 on a machine that also browsed untrusted sites, review what the exposed MCP tools could reach and rotate credentials they had access to.",
+                "If automation on the vulnerable cached Chromium drove untrusted pages, treat the runner as potentially compromised and rotate credentials reachable from it.",
+            ],
+            cleanup_and_rebuild: &[
+                "Remove stale browser builds from ~/.cache/ms-playwright (any 145.0.7632.6 build) and from every user's cache on shared hosts.",
+                "Pin playwright to the latest release per project and re-run `npx playwright install` so pinned browser revisions match the patched package.",
+            ],
+            source_repo: "https://github.com/microsoft/playwright/security/advisories",
+            source_skill: "host-runtime-response",
+            source_version: "2026-10-27",
+            bundled_skill_md: BUNDLED_HOST_RUNTIME_SKILL_MD,
+            bundled_ioc_patterns_md: BUNDLED_HOST_RUNTIME_IOC_PATTERNS_MD,
+            host_advisory: Some(HostAdvisory {
+                kind: "playwright",
+                component: "Playwright",
+                fixed_by_line: &[],
+                older_lines_vulnerable: false,
+            }),
+        }),
         other => Err(anyhow!(
-            "unsupported incident `{other}`. Current built-in incidents: `litellm`, `axios`, `mcp-stdio`, `php`, `node`, `brotli`, `emudhra`."
+            "unsupported incident `{other}`. Current built-in incidents: `litellm`, `axios`, `mcp-stdio`, `php`, `node`, `brotli`, `emudhra`, `playwright`."
         )),
     }
 }
