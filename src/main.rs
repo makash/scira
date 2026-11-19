@@ -13,7 +13,7 @@ use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use walkdir::{DirEntry, WalkDir};
 
 const MAX_TEXT_FILE_BYTES: u64 = 5 * 1024 * 1024;
@@ -70,7 +70,7 @@ enum Commands {
 #[derive(Args, Debug)]
 struct ScanArgs {
     /// Bundled incident identifier. Current built-ins: litellm, axios, mcp-stdio,
-    /// php, node, brotli, emudhra, playwright
+    /// php, node, brotli, emudhra, playwright, nginx
     incident: String,
 
     /// Scan this target path. Defaults to the current directory.
@@ -99,6 +99,11 @@ struct ScanArgs {
     /// Disable interactive prompts.
     #[arg(long)]
     non_interactive: bool,
+
+    /// Query distro security trackers (OSV) to confirm whether distro nginx
+    /// packages already carry the backported fix.
+    #[arg(long)]
+    live: bool,
 
     /// Show more finding details in text output.
     #[arg(long)]
@@ -428,6 +433,7 @@ fn run_scan_command(args: ScanArgs) -> Result<i32> {
         args.all_dirs,
         interactive,
         llm_config.is_some(),
+        args.live,
     )?;
     let rendered = match args.format {
         OutputFormat::Json => serde_json::to_string_pretty(&report)?,
@@ -485,6 +491,7 @@ fn perform_scan(
     all_dirs: bool,
     interactive: bool,
     llm_available: bool,
+    live: bool,
 ) -> Result<ScanReport> {
     let started_at = Utc::now();
     let timer = Instant::now();
@@ -505,7 +512,7 @@ fn perform_scan(
     if profile.ecosystem == "mcp" {
         scan_mcp_stdio_configs(target, &mut findings, &mut limitations)?;
     } else if let Some(advisory) = &profile.host_advisory {
-        scan_host_runtime(advisory, &mut findings, &mut limitations)?;
+        scan_host_runtime(advisory, &mut findings, &mut limitations, live)?;
     } else {
         let matcher = build_matcher(profile.search_patterns)?;
         let candidate_files = collect_candidate_files(target, &matcher, &mut limitations)?;
@@ -2414,6 +2421,7 @@ fn scan_host_runtime(
     advisory: &HostAdvisory,
     findings: &mut Findings,
     limitations: &mut Limitations,
+    live: bool,
 ) -> Result<()> {
     match advisory.kind {
         "php" => Ok(scan_host_php(advisory, findings, limitations)),
@@ -2421,6 +2429,7 @@ fn scan_host_runtime(
         "brotli" => Ok(scan_host_brotli(advisory, findings, limitations)),
         "emudhra" => Ok(scan_host_emudhra(findings, limitations)),
         "playwright" => Ok(scan_host_playwright(findings, limitations)),
+        "nginx" => Ok(scan_host_nginx(advisory, findings, limitations, live)),
         other => Err(anyhow!("unsupported host advisory kind `{other}`")),
     }
 }
@@ -3608,6 +3617,599 @@ fn scan_host_playwright(findings: &mut Findings, limitations: &mut Limitations) 
     );
 }
 
+// ---------------------------------------------------------------------------
+// NGINX NGINX2Root advisory scan (CVE-2026-123007, CVE-2026-123633)
+// ---------------------------------------------------------------------------
+
+const NGINX_PROXY_DIRECTIVES: &[&str] = &[
+    "proxy_pass",
+    "fastcgi_pass",
+    "uwsgi_pass",
+    "scgi_pass",
+    "grpc_pass",
+];
+
+struct NginxExposure {
+    http2: Option<bool>,
+    proxy: Option<bool>,
+    evidence: Vec<String>,
+}
+
+fn parse_nginx_version(output: &str) -> Option<String> {
+    for line in output.lines() {
+        for token in line.split_whitespace() {
+            if let Some(version) = token.strip_prefix("nginx/") {
+                if version
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_digit())
+                {
+                    return Some(version.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn nginx_build_info(binary: &str) -> (Option<String>, Option<bool>) {
+    // `nginx -V` prints to stderr: fork markers and configure arguments.
+    let Ok(output) = run_command_capture(binary, &["-V"]) else {
+        return (None, None);
+    };
+    let text = format!("{}{}", output.stdout, output.stderr);
+    let fork = if text.contains("Tengine") {
+        Some("tengine".to_string())
+    } else if text.contains("openresty") || text.contains("OpenResty") {
+        Some("openresty".to_string())
+    } else {
+        None
+    };
+    let has_http2_module = text
+        .lines()
+        .find(|line| line.contains("configure arguments"))
+        .map(|args| args.contains("--with-http_v2_module"));
+    (fork, has_http2_module)
+}
+
+fn discover_nginx_binaries() -> Vec<PathBuf> {
+    let mut found: BTreeSet<PathBuf> = BTreeSet::new();
+    if let Ok(output) = run_command_capture("which", &["-a", "nginx"]) {
+        for line in output.stdout.lines() {
+            let path = PathBuf::from(line.trim());
+            if path.is_file() {
+                found.insert(path);
+            }
+        }
+    }
+    for prefix in [
+        "/usr/sbin/nginx",
+        "/usr/local/sbin/nginx",
+        "/usr/local/nginx/sbin/nginx",
+        "/opt/nginx/sbin/nginx",
+    ] {
+        let path = PathBuf::from(prefix);
+        if path.is_file() {
+            found.insert(path);
+        }
+    }
+    // Canonicalize so usrmerge symlinks (/sbin -> /usr/sbin) do not double-count.
+    found = found
+        .into_iter()
+        .map(|path| path.canonicalize().unwrap_or(path))
+        .collect();
+    // Running master/worker processes catch source installs in odd prefixes.
+    if let Ok(proc_entries) = fs::read_dir("/proc") {
+        for entry in proc_entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            let comm = fs::read_to_string(entry.path().join("comm"))
+                .map(|value| value.trim().to_string())
+                .unwrap_or_default();
+            if comm != "nginx" {
+                continue;
+            }
+            if let Ok(target) = fs::read_link(entry.path().join("exe")) {
+                let resolved = if target.is_absolute() {
+                    target
+                } else {
+                    entry.path().parent().map(|p| p.join(&target)).unwrap_or(target)
+                };
+                if resolved.is_file() {
+                    found.insert(resolved);
+                }
+            }
+        }
+    }
+    found.into_iter().collect()
+}
+
+fn analyze_nginx_config_text(text: &str) -> NginxExposure {
+    let mut exposure = NginxExposure {
+        http2: Some(false),
+        proxy: Some(false),
+        evidence: Vec::new(),
+    };
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') || trimmed.is_empty() {
+            continue;
+        }
+        let http2_here = (trimmed.contains("listen") && trimmed.contains("http2"))
+            || trimmed.split(';').any(|directive| {
+                let directive = directive.trim();
+                directive == "http2 on" || directive.starts_with("http2 on ")
+            });
+        let proxy_here = NGINX_PROXY_DIRECTIVES
+            .iter()
+            .any(|directive| trimmed.contains(directive));
+        if http2_here {
+            exposure.http2 = Some(true);
+            if exposure.evidence.len() < 3 {
+                exposure.evidence.push(excerpt(trimmed, 160));
+            }
+        }
+        if proxy_here {
+            exposure.proxy = Some(true);
+            if exposure.evidence.len() < 3 {
+                exposure.evidence.push(excerpt(trimmed, 160));
+            }
+        }
+    }
+    exposure
+}
+
+fn host_nginx_config_exposure() -> NginxExposure {
+    // `nginx -T` dumps the full effective config including includes; fall back
+    // to a recursive grep over the standard config tree.
+    if let Ok(output) = run_command_capture("nginx", &["-T"]) {
+        let text = format!("{}{}", output.stdout, output.stderr);
+        if output.status.success() && !output.stdout.trim().is_empty() {
+            return analyze_nginx_config_text(&output.stdout);
+        }
+        let _ = text;
+    }
+    let script = "grep -r -h -E '(listen|http2|proxy_pass|fastcgi_pass|uwsgi_pass|scgi_pass|grpc_pass)' /etc/nginx 2>/dev/null; true";
+    if let Ok(output) = run_command_capture("sh", &["-lc", script]) {
+        return analyze_nginx_config_text(&output.stdout);
+    }
+    NginxExposure {
+        http2: None,
+        proxy: None,
+        evidence: Vec::new(),
+    }
+}
+
+fn container_nginx_config_exposure(container: &str) -> NginxExposure {
+    let script = "nginx -T 2>/dev/null || grep -r -h -E '(listen|http2|proxy_pass|fastcgi_pass|uwsgi_pass|scgi_pass|grpc_pass)' /etc/nginx 2>/dev/null; true";
+    match docker_exec_output(container, script) {
+        Some(stdout) => analyze_nginx_config_text(&stdout),
+        None => NginxExposure {
+            http2: None,
+            proxy: None,
+            evidence: Vec::new(),
+        },
+    }
+}
+
+enum NginxLiveStatus {
+    StillVulnerable,
+    BackportConfirmed,
+    Unknown,
+}
+
+fn osv_ids_for_query(body: serde_json::Value) -> Option<Vec<String>> {
+    let vulns = body.get("vulns")?.as_array()?.clone();
+    let mut ids = Vec::new();
+    for vuln in &vulns {
+        for field in ["id", "upstream"] {
+            if let Some(id) = vuln.get(field).and_then(|v| v.as_str()) {
+                ids.push(id.to_string());
+            }
+        }
+        if let Some(aliases) = vuln.get("aliases").and_then(|v| v.as_array()) {
+            for alias in aliases {
+                if let Some(id) = alias.as_str() {
+                    ids.push(id.to_string());
+                }
+            }
+        }
+    }
+    Some(ids)
+}
+
+fn osv_nginx_live_status(ecosystem: &str, version: &str) -> Option<NginxLiveStatus> {
+    // OSV distro ecosystems encode backported fixes as fixed versions in
+    // Debian-style packaging versions (e.g. 1.24.0-2ubuntu7.20, USN-9159-1).
+    // Distro record ids are UBUNTU-CVE-*, so match the CVE number anywhere.
+    let client = Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .ok()?;
+    let ours = |ids: &[String]| {
+        ids.iter().any(|id| {
+            id.contains("CVE-2026-123007") || id.contains("CVE-2026-123633")
+        })
+    };
+
+    // Query 1: installed package+version. Our CVEs matching here means the
+    // installed distro version is still inside the affected range.
+    let version_body = json!({
+        "package": { "name": "nginx", "ecosystem": ecosystem },
+        "version": version,
+    });
+    let response = client
+        .post("https://api.osv.dev/v1/query")
+        .json(&version_body)
+        .send()
+        .ok()?;
+    if !response.status().is_success() {
+        return Some(NginxLiveStatus::Unknown);
+    }
+    let value: Value = response.json().ok()?;
+    let version_ids = osv_ids_for_query(value)?;
+    if ours(&version_ids) {
+        return Some(NginxLiveStatus::StillVulnerable);
+    }
+
+    // Query 2 (only when the installed version did not match): does OSV know
+    // these CVEs for this package at all? Present here but absent above means
+    // the installed version sits outside the affected range: backport
+    // confirmed. Absent entirely means OSV has no distro data yet: unknown.
+    let package_body = json!({
+        "package": { "name": "nginx", "ecosystem": ecosystem },
+    });
+    let response = client
+        .post("https://api.osv.dev/v1/query")
+        .json(&package_body)
+        .send()
+        .ok()?;
+    if !response.status().is_success() {
+        return Some(NginxLiveStatus::Unknown);
+    }
+    let value: Value = response.json().ok()?;
+    let package_ids = osv_ids_for_query(value)?;
+    if ours(&package_ids) {
+        Some(NginxLiveStatus::BackportConfirmed)
+    } else {
+        Some(NginxLiveStatus::Unknown)
+    }
+}
+
+fn detect_osv_ecosystem() -> Option<String> {
+    let os_release = fs::read_to_string("/etc/os-release").ok()?;
+    let mut id = String::new();
+    let mut version_id = String::new();
+    for line in os_release.lines() {
+        if let Some(value) = line.strip_prefix("ID=") {
+            id = value.trim_matches('"').to_string();
+        }
+        if let Some(value) = line.strip_prefix("VERSION_ID=") {
+            version_id = value.trim_matches('"').to_string();
+        }
+    }
+    match id.as_str() {
+        "ubuntu" => Some(format!("Ubuntu:{version_id}:LTS")),
+        "debian" => Some(format!("Debian:{version_id}")),
+        _ => None,
+    }
+}
+
+fn nginx_status_and_note(
+    advisory: &HostAdvisory,
+    version: &str,
+    fork: &Option<String>,
+    has_http2_module: Option<bool>,
+    exposure: &NginxExposure,
+) -> (VersionHitStatus, String) {
+    let mut notes = Vec::new();
+    if let Some(fork) = fork {
+        notes.push(format!("{fork} fork pins its own nginx core; check the fork's advisory"));
+    }
+    if version_cmp(version, "1.9.5") == std::cmp::Ordering::Less {
+        notes.push(
+            "below the affected range for the HTTP/2 CVEs (resolver UAF CVE-2026-123634 reaches 0.6.18) — upgrade anyway".to_string(),
+        );
+        return (VersionHitStatus::Other, notes.join("; "));
+    }
+    let (status, fixed) = host_version_status(advisory, version);
+    match status {
+        VersionHitStatus::Compromised => {
+            if has_http2_module == Some(false) {
+                notes.push(
+                    "http_v2 module not compiled in, so the HTTP/2 CVEs are unreachable — verify other wave CVEs".to_string(),
+                );
+                return (VersionHitStatus::Other, notes.join("; "));
+            }
+            match exposure.http2 {
+                Some(true) => {
+                    notes.push("HTTP/2 ENABLED in config — EXPOSED (CVE-2026-123007 unauth RCE)".to_string());
+                    if exposure.proxy == Some(true) {
+                        notes.push("proxied backend present, so CVE-2026-123633 also applies".to_string());
+                    }
+                }
+                Some(false) => notes.push(
+                    "no HTTP/2 found in the readable config — verify includes and per-server overrides before relying on this".to_string(),
+                ),
+                None => notes.push("config not readable; exposure unknown — verify manually".to_string()),
+            }
+            if let Some(fixed) = fixed {
+                notes.push(format!("fixed in {fixed} (or distro backport)"));
+            }
+            (VersionHitStatus::Compromised, notes.join("; "))
+        }
+        VersionHitStatus::Safe => {
+            if exposure.http2 == Some(true) {
+                notes.push("HTTP/2 enabled but this version is on a fixed line".to_string());
+            }
+            (VersionHitStatus::Safe, notes.join("; "))
+        }
+        VersionHitStatus::Other => {
+            notes.push("newer than the fixed-version table; verify against the advisory".to_string());
+            (VersionHitStatus::Other, notes.join("; "))
+        }
+    }
+}
+
+fn record_nginx_hit(
+    source: &str,
+    path: &str,
+    version: &str,
+    note: &str,
+    status: VersionHitStatus,
+    findings: &mut Findings,
+) {
+    findings.version_hits.push(VersionHit {
+        path: path.to_string(),
+        line_number: 0,
+        line: format!("detected nginx {version} via {source}; {note}"),
+        version: version.to_string(),
+        status,
+    });
+}
+
+fn scan_k8s_ingress_nginx(findings: &mut Findings, limitations: &mut Limitations) {
+    if !command_exists("kubectl") {
+        limitations
+            .not_inspected
+            .push("k8s ingress-nginx checks skipped (kubectl not installed)".to_string());
+        return;
+    }
+    let Ok(output) =
+        run_command_capture("kubectl", &["get", "pods", "-A", "-o", "json"])
+    else {
+        limitations
+            .missing_tools
+            .push("kubectl (cluster not reachable)".to_string());
+        return;
+    };
+    if !output.status.success() {
+        limitations
+            .missing_tools
+            .push("kubectl (cluster not reachable)".to_string());
+        return;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(&output.stdout) else {
+        limitations
+            .not_inspected
+            .push("k8s pod list not parseable".to_string());
+        return;
+    };
+    let mut images: BTreeSet<String> = BTreeSet::new();
+    if let Some(items) = value.get("items").and_then(|items| items.as_array()) {
+        for item in items {
+            let Some(spec) = item.get("spec") else { continue };
+            for field in ["containers", "initContainers"] {
+                if let Some(containers) = spec.get(field).and_then(|c| c.as_array()) {
+                    for container in containers {
+                        if let Some(image) = container.get("image").and_then(|i| i.as_str()) {
+                            if image.contains("ingress-nginx") {
+                                images.insert(image.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if images.is_empty() {
+        limitations
+            .notes
+            .push("no ingress-nginx pods found in the reachable cluster".to_string());
+        return;
+    }
+    for image in images {
+        findings.environment_hits.push(EnvironmentFinding {
+            check: "k8s_ingress_nginx".to_string(),
+            status: "present".to_string(),
+            details: format!(
+                "ingress-nginx controller image {image}; the controller embeds its own nginx core — check the ingress-nginx release notes for the NGINX2Root (CVE-2026-123007/-123633) backport and upgrade the controller"
+            ),
+            version: None,
+            bad_version: false,
+            raw: None,
+        });
+    }
+}
+
+fn scan_host_nginx(
+    advisory: &HostAdvisory,
+    findings: &mut Findings,
+    limitations: &mut Limitations,
+    live: bool,
+) {
+    // --- host binaries (PATH, standard prefixes, running processes) ---
+    let binaries = discover_nginx_binaries();
+    let host_exposure = if binaries.is_empty() {
+        NginxExposure { http2: None, proxy: None, evidence: Vec::new() }
+    } else {
+        host_nginx_config_exposure()
+    };
+
+    // --- distro packages: a live-confirmed backport also covers the host
+    //     binaries shipped by that package (same upstream version). ---
+    let mut confirmed_safe_upstream: Option<String> = None;
+    let mut dpkg_hits: Vec<(String, String, VersionHitStatus, String)> = Vec::new();
+    let mut recorded_dpkg: BTreeSet<String> = BTreeSet::new();
+    for (package, version) in dpkg_installed_packages() {
+        let canonical = package == "nginx"
+            || ["nginx-core", "nginx-full", "nginx-light", "nginx-extra"]
+                .contains(&package.as_str());
+        if !canonical {
+            continue;
+        }
+        let upstream = version
+            .split(':')
+            .last()
+            .unwrap_or(&version)
+            .split('-')
+            .next()
+            .unwrap_or(&version)
+            .to_string();
+        if !recorded_dpkg.insert(upstream.clone()) {
+            continue;
+        }
+        let (status, note) = nginx_status_and_note(advisory, &upstream, &None, None, &host_exposure);
+        let mut status = status;
+        let mut note = note;
+        note.push_str(&format!(
+            "; distro package {package} {version} — fixes land as backports"
+        ));
+        if live {
+            match detect_osv_ecosystem()
+                .and_then(|ecosystem| osv_nginx_live_status(&ecosystem, &version))
+            {
+                Some(NginxLiveStatus::StillVulnerable) => {
+                    note.push_str("; OSV confirms the installed distro version is still affected");
+                }
+                Some(NginxLiveStatus::BackportConfirmed) => {
+                    status = VersionHitStatus::Safe;
+                    confirmed_safe_upstream = Some(upstream.clone());
+                    note.push_str("; OSV confirms the installed distro version is outside the affected range (backport/USN applied)");
+                }
+                _ => note.push_str(
+                    "; live OSV lookup inconclusive (no distro data or network), version-string verdict stands",
+                ),
+            }
+        } else if matches!(status, VersionHitStatus::Compromised) {
+            note.push_str("; re-run with --live to confirm against the distro tracker");
+        }
+        dpkg_hits.push((package.clone(), upstream, status, note));
+    }
+
+    // Emit binary hits, then dpkg hits.
+    for binary in &binaries {
+        let Ok(output) = run_command_capture(&binary.to_string_lossy(), &["-v"]) else {
+            limitations
+                .permission_denied_paths
+                .push(binary.to_string_lossy().to_string());
+            continue;
+        };
+        let version_text = format!("{}{}", output.stdout, output.stderr);
+        let Some(version) = parse_nginx_version(&version_text) else {
+            limitations
+                .not_inspected
+                .push(format!("could not parse version output of {}", binary.display()));
+            continue;
+        };
+        let (fork, has_http2_module) = nginx_build_info(&binary.to_string_lossy());
+        let (status, note) =
+            nginx_status_and_note(advisory, &version, &fork, has_http2_module, &host_exposure);
+        let (status, note) =
+            if Some(&version) == confirmed_safe_upstream.as_ref() {
+                (
+                    VersionHitStatus::Safe,
+                    format!("{note}; distro package for this binary confirmed patched via OSV (backport/USN)"),
+                )
+            } else {
+                (status, note)
+            };
+        record_nginx_hit(
+            "host binary",
+            &binary.to_string_lossy(),
+            &version,
+            &note,
+            status,
+            findings,
+        );
+    }
+    if binaries.is_empty() {
+        limitations
+            .not_inspected
+            .push("no host nginx binary found (PATH, standard prefixes, running processes)".to_string());
+    }
+
+    // Emit dpkg hits (after binaries so confirmed_safe_upstream context is final).
+    for (package, upstream, status, note) in dpkg_hits {
+        record_nginx_hit(
+            &format!("dpkg {package}"),
+            &format!("dpkg:{package}"),
+            &upstream,
+            &note,
+            status,
+            findings,
+        );
+    }
+
+    // --- running containers ---
+    if let Some(containers) = docker_running_containers() {
+        for (name, image) in containers {
+            let Some(version_text) = docker_exec_output(&name, "nginx -v 2>&1") else {
+                continue;
+            };
+            let Some(version) = parse_nginx_version(&version_text) else {
+                continue;
+            };
+            let exposure = container_nginx_config_exposure(&name);
+            let (status, note) = nginx_status_and_note(advisory, &version, &None, None, &exposure);
+            record_nginx_hit(
+                "docker exec",
+                &format!("docker:{name} ({image})"),
+                &version,
+                &note,
+                status,
+                findings,
+            );
+        }
+        // --- image metadata (stopped containers included) ---
+        if let Some(images) = docker_images() {
+            for image in images {
+                if let Some(env) = docker_image_env(&image) {
+                    if let Some(version) = env_value(&env, "NGINX_VERSION") {
+                        let (status, note) = nginx_status_and_note(
+                            advisory,
+                            &version,
+                            &None,
+                            None,
+                            &NginxExposure { http2: None, proxy: None, evidence: Vec::new() },
+                        );
+                        findings.environment_hits.push(EnvironmentFinding {
+                            check: "docker_image_nginx_version".to_string(),
+                            status: "present".to_string(),
+                            details: format!(
+                                "image {image} metadata declares nginx {version}; confirm inside the running container; {note}"
+                            ),
+                            version: Some(version),
+                            bad_version: matches!(status, VersionHitStatus::Compromised),
+                            raw: None,
+                        });
+                    }
+                }
+            }
+        }
+    } else {
+        note_docker_unavailable(limitations, true);
+    }
+
+    scan_k8s_ingress_nginx(findings, limitations);
+
+    limitations.notes.push(
+        "The November 2026 wave shares one fix release pair (1.30.7 / 1.31.9): resolver UAF CVE-2026-123634 (0.6.18+), HTTP/3 UAF CVE-2026-121810 (1.25.0+), TLS 1.3 loop CVE-2026-118899, try_files/alias overflow CVE-2026-125283, and a mail-proxy UAF are covered by the same upgrade.".to_string(),
+    );
+}
+
 fn build_summary(findings: &Findings, limitations: &Limitations) -> Summary {
     let high_mcp_risk = findings
         .mcp_risk_hits
@@ -4657,8 +5259,46 @@ fn incident_profile(id: &str) -> Result<IncidentProfile> {
                 older_lines_vulnerable: false,
             }),
         }),
+        "nginx" | "nginx-http2" | "nginx2root" => Ok(IncidentProfile {
+            id: "nginx",
+            title: "NGINX HTTP/2 memory corruption RCEs (CVE-2026-123007, CVE-2026-123633, NGINX2Root)",
+            ecosystem: "host-runtime",
+            package: "nginx",
+            bad_versions: &[],
+            safe_version: "1.30.7 / 1.31.9 (or your distro's backported package)",
+            malicious_dependency: None,
+            related_package_names: &["nginx"],
+            ioc_domains: &[],
+            ioc_files: &[],
+            search_patterns: &[],
+            immediate_next_steps: &[
+                "Upgrade nginx to 1.30.7 (stable) / 1.31.9 (mainline) or your distro's patched package; the same releases fix the whole November 2026 wave (resolver UAF CVE-2026-123634, HTTP/3 UAF CVE-2026-121810, TLS 1.3 loop CVE-2026-118899, try_files/alias overflow CVE-2026-125283, mail UAF).",
+                "If you cannot upgrade immediately, disable HTTP/2 on client-facing listeners: set `http2 off;` (1.25.1+) and remove the `http2` parameter from listen directives, then reload and confirm old workers exited.",
+                "Prioritize internet-facing listeners with HTTP/2 enabled: CVE-2026-123007 (CVSS 9.2) is unauthenticated RCE with a public PoC that works against stock TLS+HTTP/2 static-file configs, no backend needed.",
+                "Distro packages (Ubuntu/Debian) receive the fix as a backport without a version bump: run with `--live` to confirm against the distro tracker, or check the vendor USN.",
+            ],
+            credential_rotation_scope: &[
+                "If an internet-facing vulnerable nginx with HTTP/2 ran since 2026-11-18 disclosure, treat the worker context as potentially compromised: review access logs for HTTP/2 stream-cancellation patterns, preserve evidence, rotate credentials readable by the nginx worker.",
+                "On shared/container hosts remember the demonstrated chain: worker RCE plus a kernel flaw can reach root — check what the worker user can reach.",
+            ],
+            cleanup_and_rebuild: &[
+                "Rebuild nginx-based images from updated bases (official images track the fixed releases) and redeploy; confirm `nginx -v` inside each container.",
+                "OpenResty/Tengine/Kong deployments pin their own nginx core: check the fork's advisory for their rebased releases.",
+            ],
+            source_repo: "https://nginx.org/en/security_advisories.html",
+            source_skill: "host-runtime-response",
+            source_version: "2026-11-18",
+            bundled_skill_md: BUNDLED_HOST_RUNTIME_SKILL_MD,
+            bundled_ioc_patterns_md: BUNDLED_HOST_RUNTIME_IOC_PATTERNS_MD,
+            host_advisory: Some(HostAdvisory {
+                kind: "nginx",
+                component: "NGINX",
+                fixed_by_line: &[("1.30", "1.30.7"), ("1.31", "1.31.9")],
+                older_lines_vulnerable: true,
+            }),
+        }),
         other => Err(anyhow!(
-            "unsupported incident `{other}`. Current built-in incidents: `litellm`, `axios`, `mcp-stdio`, `php`, `node`, `brotli`, `emudhra`, `playwright`."
+            "unsupported incident `{other}`. Current built-in incidents: `litellm`, `axios`, `mcp-stdio`, `php`, `node`, `brotli`, `emudhra`, `playwright`, `nginx`."
         )),
     }
 }

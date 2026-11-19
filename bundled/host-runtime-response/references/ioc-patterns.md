@@ -17,6 +17,8 @@
 | n8n Browser Use upload tool (`N8N_INSTANCE_AI_BROWSER_USE_ENABLED`) | < 2.46.1 / 2.45.5 / 3.0.1 | 2.46.1 / 2.45.5 / 3.0.1 | GHSA-9qx8-fhxv-w794 (arbitrary file read) |
 | browserless | 1.44.0 – 2.56.7 | 2.56.8+ | CVE-2026-92811 (file:// read via Playwright WS) |
 | Lookyloo PlaywrightCapture (pip) | < 1.39.6 | 1.39.6 | CVE-2026-44439 (local file/internal network access) |
+| NGINX (CVE-2026-123007, HTTP/2 flow-control RCE) | 1.9.5 – 1.31.8 + HTTP/2 listener + http_v2 module | 1.30.7 / 1.31.9 / distro backport | NGINX2Root, CVSS 9.2, public PoC; NGINX Plus 37.0.8.1 / 37.3.0.1 |
+| NGINX (CVE-2026-123633, HTTP/2 UAF) | 1.19.7 – 1.31.8 + HTTP/2 + proxied backend (proxy_pass and friends) + connection draining | 1.30.7 / 1.31.9 / distro backport | CVSS 8.1; DoS primary, RCE needs ASLR bypass |
 
 ## Distro package notes
 
@@ -71,3 +73,8 @@ only, not an incident): `emSign Root CA - G1`, `emSign Root CA - C1`,
 - @playwright/mcp advisory: https://github.com/advisories/GHSA-6fg3-hvw7-2fwq
 - Open WebUI advisory: https://github.com/open-webui/open-webui/security/advisories/GHSA-4v28-j6q3-5m4r
 - n8n advisory: https://github.com/n8n-io/n8n/security/advisories/GHSA-9qx8-fhxv-w794
+- NGINX advisories: https://nginx.org/en/security_advisories.html
+- NGINX CHANGES (fixes): https://nginx.org/en/CHANGES-1.30
+- Rapid7 disclosure: https://www.rapid7.com/blog/post/ve-cve-2026-123007-critical-nginx-http-2-integer-underflow-leads-to-rce-fixed/
+- Wiz analysis: https://www.wiz.io/blog/nginx-http2-rce-vulnerabilities
+- CERT-EU advisory 2026-022: https://www.cert.europa.eu/publications/security-advisories/2026-022/

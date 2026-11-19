@@ -98,6 +98,41 @@ Docker image metadata, Python environments, and TLS trust stores.
   CVE-2026-92811 (< 2.56.8), Lookyloo PlaywrightCapture < 1.39.6
   (CVE-2026-44439).
 
+## Advisory 6: NGINX HTTP/2 memory-corruption RCEs (NGINX2Root, 2026-11-18)
+
+- F5/Rapid7 disclosed two unauthenticated memory-safety flaws in nginx's
+  HTTP/2 module on 2026-11-18, fixed in nginx 1.30.7 (stable) and 1.31.9
+  (mainline):
+  - CVE-2026-123007 (CVSS 9.2): integer underflow in HTTP/2 flow control
+    causes an out-of-bounds heap write during stream cancellation. Public
+    PoC; unauthenticated RCE demonstrated against official images serving
+    static files over TLS+HTTP/2 with no backend. Affected 1.9.5-1.31.8.
+  - CVE-2026-123633 (CVSS 8.1): use-after-free when HTTP/2 client
+    connections are drained while nginx connects to an upstream and the
+    worker is low on worker_connections. Primarily DoS; code execution
+    possible with ASLR bypass/disabled. Affected 1.19.7-1.31.8 with a
+    proxied backend.
+- Exposure requires HTTP/2 on a client-facing listener (`listen ... http2`
+  or `http2 on;`) AND the http_v2 module compiled in (default in distro and
+  official builds, not in bare `./configure` builds). nginx serving plain
+  HTTP/1.1, or acting as an h1 backend behind an h2 load balancer, is not
+  exposed.
+- Fastest mitigation: `http2 off;` (1.25.1+) and remove `http2` from listen
+  directives, reload, confirm old workers exited.
+- Distro packages get backports without version bumps (e.g. Ubuntu noble
+  1.24.0-2ubuntu7.x): `scira scan nginx --live` confirms the installed
+  package against OSV's Ubuntu/Debian data.
+- Same release wave: resolver UAF CVE-2026-123634 (0.6.18+), HTTP/3 UAF
+  CVE-2026-121810 (1.25.0+), TLS 1.3 request-body loop CVE-2026-118899,
+  try_files/alias buffer overflow CVE-2026-125283, mail-proxy UAF. One
+  upgrade fixes all.
+- Forks/embedders: OpenResty, Tengine, Kong pin their own nginx core —
+  check their advisories. ingress-nginx (k8s) embeds nginx and is upgraded
+  via controller releases. NGINX Plus fixed in 37.0.8.1 / 37.3.0.1.
+- Researchers demonstrated chaining worker-context RCE with a kernel flaw
+  to reach root from inside containers ("NGINX2Root") — treat exposed
+  multi-tenant hosts with extra urgency.
+
 ## Response priorities
 
 1. Inventory first: enumerate every PHP/Node/Brotli install on the host,
