@@ -1,8 +1,8 @@
 [package]
 name = "supply-chain-security-incident-response-agent"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
-description = "scira: deployable host-side incident response agent for PyPI supply chain attacks"
+description = "scira: deployable host-side incident response agent for supply chain and runtime security advisories"
 license = "MIT"
 
 [[bin]]
