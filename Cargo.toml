@@ -1,6 +1,6 @@
 [package]
 name = "supply-chain-security-incident-response-agent"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "scira: deployable host-side incident response agent for supply chain and runtime security advisories"
 license = "MIT"
