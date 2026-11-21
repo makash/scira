@@ -4034,6 +4034,55 @@ fn scan_k8s_ingress_nginx(findings: &mut Findings, limitations: &mut Limitations
     }
 }
 
+/// A distro package whose installed version OSV positively confirmed sits
+/// outside the affected range, together with the exact files that package
+/// owns. Only these files may inherit the Safe verdict — never a different
+/// install that merely reports the same upstream version.
+#[derive(Debug, Clone)]
+struct ConfirmedSafePackage {
+    upstream: String,
+    owned_files: BTreeSet<PathBuf>,
+}
+
+/// A host binary inherits the OSV-confirmed backport verdict only when the
+/// patched distro package owns that exact file path AND the binary reports
+/// the same upstream version as the confirmed package.
+fn inherits_dpkg_safe(
+    binary: &Path,
+    version: &str,
+    confirmed: Option<&ConfirmedSafePackage>,
+) -> bool {
+    match confirmed {
+        Some(confirmed) => {
+            confirmed.upstream == version && confirmed.owned_files.contains(binary)
+        }
+        None => false,
+    }
+}
+
+/// Resolve the file list owned by the given dpkg packages (canonicalized).
+fn dpkg_owned_files(packages: &[String]) -> BTreeSet<PathBuf> {
+    let mut owned: BTreeSet<PathBuf> = BTreeSet::new();
+    for package in packages {
+        if let Ok(output) = run_command_capture("dpkg-query", &["-L", package]) {
+            if !output.status.success() {
+                continue;
+            }
+            for line in output.stdout.lines() {
+                let line = line.trim();
+                if !line.starts_with('/') {
+                    continue;
+                }
+                let path = PathBuf::from(line);
+                if path.is_file() {
+                    owned.insert(path.canonicalize().unwrap_or(path));
+                }
+            }
+        }
+    }
+    owned
+}
+
 fn scan_host_nginx(
     advisory: &HostAdvisory,
     findings: &mut Findings,
@@ -4050,9 +4099,10 @@ fn scan_host_nginx(
 
     // --- distro packages: a live-confirmed backport also covers the host
     //     binaries shipped by that package (same upstream version). ---
-    let mut confirmed_safe_upstream: Option<String> = None;
+    let mut confirmed_safe: Option<ConfirmedSafePackage> = None;
     let mut dpkg_hits: Vec<(String, String, VersionHitStatus, String)> = Vec::new();
     let mut recorded_dpkg: BTreeSet<String> = BTreeSet::new();
+    let mut canonical_packages: Vec<(String, String)> = Vec::new();
     for (package, version) in dpkg_installed_packages() {
         let canonical = package == "nginx"
             || ["nginx-core", "nginx-full", "nginx-light", "nginx-extra"]
@@ -4071,6 +4121,7 @@ fn scan_host_nginx(
         if !recorded_dpkg.insert(upstream.clone()) {
             continue;
         }
+        canonical_packages.push((package.clone(), upstream.clone()));
         let (status, note) = nginx_status_and_note(advisory, &upstream, &None, None, &host_exposure);
         let mut status = status;
         let mut note = note;
@@ -4086,7 +4137,18 @@ fn scan_host_nginx(
                 }
                 Some(NginxLiveStatus::BackportConfirmed) => {
                     status = VersionHitStatus::Safe;
-                    confirmed_safe_upstream = Some(upstream.clone());
+                    // Tie the verdict to the exact files the patched packages
+                    // own: a different install reporting the same upstream
+                    // version must NOT inherit Safe.
+                    let owners: Vec<String> = canonical_packages
+                        .iter()
+                        .filter(|(_, pkg_upstream)| pkg_upstream == &upstream)
+                        .map(|(pkg, _)| pkg.clone())
+                        .collect();
+                    confirmed_safe = Some(ConfirmedSafePackage {
+                        upstream: upstream.clone(),
+                        owned_files: dpkg_owned_files(&owners),
+                    });
                     note.push_str("; OSV confirms the installed distro version is outside the affected range (backport/USN applied)");
                 }
                 _ => note.push_str(
@@ -4117,15 +4179,22 @@ fn scan_host_nginx(
         let (fork, has_http2_module) = nginx_build_info(&binary.to_string_lossy());
         let (status, note) =
             nginx_status_and_note(advisory, &version, &fork, has_http2_module, &host_exposure);
-        let (status, note) =
-            if Some(&version) == confirmed_safe_upstream.as_ref() {
-                (
-                    VersionHitStatus::Safe,
-                    format!("{note}; distro package for this binary confirmed patched via OSV (backport/USN)"),
-                )
-            } else {
-                (status, note)
-            };
+        let (status, note) = if inherits_dpkg_safe(binary, &version, confirmed_safe.as_ref()) {
+            (
+                VersionHitStatus::Safe,
+                format!("{note}; package-owned binary covered by the OSV-confirmed distro backport"),
+            )
+        } else if confirmed_safe
+            .as_ref()
+            .is_some_and(|confirmed| confirmed.upstream == version)
+        {
+            (
+                status,
+                format!("{note}; reports the same upstream version as the patched distro package but is NOT owned by it — verify this install independently"),
+            )
+        } else {
+            (status, note)
+        };
         record_nginx_hit(
             "host binary",
             &binary.to_string_lossy(),
@@ -5904,6 +5973,47 @@ fn expand_tilde(path: PathBuf) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: on a mixed-install host, two binaries can report the same
+    /// upstream version while only one is owned by the patched distro package.
+    /// Only the package-owned binary may inherit the OSV-confirmed Safe
+    /// verdict; the separate install must keep the version-string verdict.
+    /// (Found in v0.3.0: --live applied Safe to every binary with the same
+    /// upstream version, regardless of which package owned it.)
+    #[test]
+    fn only_package_owned_binary_inherits_live_safe_verdict() {
+        let mut owned = BTreeSet::new();
+        owned.insert(PathBuf::from("/usr/sbin/nginx"));
+        let confirmed = ConfirmedSafePackage {
+            upstream: "1.24.0".to_string(),
+            owned_files: owned,
+        };
+
+        // Package-owned binary, same version: inherits Safe.
+        assert!(inherits_dpkg_safe(
+            &Path::new("/usr/sbin/nginx"),
+            "1.24.0",
+            Some(&confirmed)
+        ));
+        // Same version, different install (e.g. source build): must NOT inherit.
+        assert!(!inherits_dpkg_safe(
+            &Path::new("/opt/nginx/sbin/nginx"),
+            "1.24.0",
+            Some(&confirmed)
+        ));
+        // Package-owned path but a different version: must NOT inherit.
+        assert!(!inherits_dpkg_safe(
+            &Path::new("/usr/sbin/nginx"),
+            "1.26.0",
+            Some(&confirmed)
+        ));
+        // No live confirmation: never inherits.
+        assert!(!inherits_dpkg_safe(
+            &Path::new("/usr/sbin/nginx"),
+            "1.24.0",
+            None
+        ));
+    }
 
     fn mcp_server(config: Value) -> McpServerFinding {
         normalize_mcp_server(Path::new(".mcp.json"), "mcpServers", "demo", &config).unwrap()
